@@ -60,7 +60,6 @@ plt.xticks(rotation=45, ha='right')
 plt.grid(True, linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
-plt.show()
 
 # Rolling Average / Growth Rate (Month-over-Month %)  [Bar]
 monthly_orders = df.groupby('year_month')['order_id'].nunique()
