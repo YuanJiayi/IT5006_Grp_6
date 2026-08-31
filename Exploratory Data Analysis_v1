@@ -1,4 +1,10 @@
 # Temporal patterns (order volume, seasonality)
+- Overall order volume trend
+- Seasonality at the monthly level
+- Seasonality at the day-of-week level
+- Order Status over Time (To explain end of dataset drop to 0)
+- Month-over-Month Growth (%) (Growth rate quantification)
+
 
 # Monthly Order Volume
 monthly_orders = df.groupby('year_month')['order_id'].nunique()
