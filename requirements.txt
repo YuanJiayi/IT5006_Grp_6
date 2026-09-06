@@ -1,2 +1,6 @@
 streamlit
 pandas
+altair
+folium
+branca
+ipython
