@@ -7,13 +7,18 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_data import (
+    build_category_cuts,
     build_commercial_series,
     build_delivery_experience_series,
     build_delivery_review_analysis,
     build_delivery_series,
+    build_distance_buckets,
+    build_distance_table,
     build_growth_series,
+    build_leadtime_decomposition,
     build_retention_series,
     build_review_series,
+    build_seller_cuts,
     eligible_deliveries,
     latest_reviews as select_latest_reviews,
     load_customer_ids,
@@ -24,11 +29,16 @@ from dashboard_data import (
 DATA_PATH = Path("data/smartcommerce_consolidated.csv")
 CUSTOMERS_PATH = Path("data/olist_customers_dataset.csv")
 REVIEWS_PATH = Path("data/olist_order_reviews_dataset.csv")
+ORDERS_PATH = Path("data/olist_orders_dataset.csv")
+SELLERS_PATH = Path("data/olist_sellers_dataset.csv")
+GEOLOCATION_PATH = Path("data/olist_geolocation_dataset.csv")
 
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-overview_tab, delivery_tab = st.tabs(["Overview", "Delivery"])
+overview_tab, delivery_tab, delivery_correlations_tab = st.tabs(
+    ["Overview", "Delivery", "Delivery correlations"]
+)
 
 with overview_tab:
     required_paths = [DATA_PATH, CUSTOMERS_PATH, REVIEWS_PATH]
@@ -342,3 +352,252 @@ with delivery_tab:
             use_container_width=True,
         )
     st.caption("Low rating: 1–2 stars. Each order uses its latest review record.")
+
+def boxed_label(text: str) -> None:
+    """Render a filled label chip that captions the chart directly below it."""
+    st.markdown(
+        "<span style='display:inline-block;background:#003D7C;color:#FFFFFF;"
+        "font-weight:600;font-size:0.85rem;letter-spacing:0.03em;"
+        "text-transform:uppercase;padding:3px 12px;border-radius:4px;"
+        f"margin-bottom:10px;'>{text}</span>",
+        unsafe_allow_html=True,
+    )
+
+
+with delivery_correlations_tab:
+    corr_required = [DATA_PATH, ORDERS_PATH, CUSTOMERS_PATH, SELLERS_PATH, GEOLOCATION_PATH, REVIEWS_PATH]
+    if not all(path.exists() for path in corr_required):
+        st.error("Required data files for this tab could not be found in the `data` folder.")
+        st.stop()
+
+    st.caption(
+        "Order-level view. `order_approved_at` / `order_delivered_carrier_date` are "
+        "read from `olist_orders_dataset.csv` (absent from the consolidated file) and "
+        "merged on `order_id`."
+    )
+
+    (
+        stage_summary,
+        shipping_review,
+        excluded_share,
+        total_lead_mean,
+    ) = build_leadtime_decomposition(ORDERS_PATH, REVIEWS_PATH)
+    distance_table, dropped_share = build_distance_table(
+        DATA_PATH, CUSTOMERS_PATH, SELLERS_PATH, GEOLOCATION_PATH, REVIEWS_PATH
+    )
+    distance_buckets = build_distance_buckets(distance_table)
+    category_cuts = build_category_cuts(DATA_PATH, REVIEWS_PATH, min_orders=100)
+    top_categories = category_cuts.head(13)
+    category_order = top_categories["product_category_name_english"].tolist()
+    seller_cuts = build_seller_cuts(DATA_PATH, REVIEWS_PATH, min_orders=20)
+    volume_threshold = float(seller_cuts["orders"].quantile(0.90))
+    seller_cuts = seller_cuts.assign(
+        volume_band=lambda frame: frame["orders"]
+        .ge(volume_threshold)
+        .map({True: "Top-decile volume", False: "Other sellers"})
+    )
+
+    # Processing is a tiny slice, so it gets the high-contrast orange to pop;
+    # handling takes the dark blue, shipping the lighter blue.
+    STAGE_COLORS = ["#EF7C00", "#003D7C", "#7FA9D0"]
+
+    row1_left, row1_right = st.columns(2)
+
+    with row1_left:
+        with st.container(border=True):
+            boxed_label("Decomposition")
+            stat_choice = st.radio(
+                "Value used for the breakdown",
+                ["Mean", "Median"],
+                horizontal=True,
+                key="leadtime_stat",
+            )
+            value_column = {"Mean": "mean_days", "Median": "median_days"}[stat_choice]
+            stage_order = stage_summary["stage"].tolist()
+            stage_share = stage_summary[["stage", value_column]].rename(columns={value_column: "days"})
+            stage_share["share_pct"] = stage_share["days"] / stage_share["days"].sum() * 100
+            stage_share["slice_label"] = stage_share.apply(
+                lambda row: f"{row['days']:.1f}d ({row['share_pct']:.0f}%)", axis=1
+            )
+
+            stage_base = alt.Chart(stage_share).encode(
+                theta=alt.Theta("days:Q", stack=True),
+                color=alt.Color(
+                    "stage:N",
+                    title=None,
+                    sort=stage_order,
+                    scale=alt.Scale(domain=stage_order, range=STAGE_COLORS),
+                    legend=alt.Legend(orient="bottom", columns=1),
+                ),
+                order=alt.Order("stage:N", sort="ascending"),
+                tooltip=[
+                    alt.Tooltip("stage:N", title="Stage"),
+                    alt.Tooltip("days:Q", title=f"{stat_choice} days", format=".2f"),
+                    alt.Tooltip("share_pct:Q", title="Share of shipping time", format=".1f"),
+                ],
+            )
+            stage_pie = stage_base.mark_arc(outerRadius=88, stroke="#FFFFFF", strokeWidth=2)
+            stage_pie_labels = stage_base.mark_text(radius=112, fontSize=12, fontWeight="bold").encode(
+                text="slice_label:N", color=alt.value("#31333F")
+            )
+            st.altair_chart(
+                (stage_pie + stage_pie_labels).properties(height=340),
+                use_container_width=True,
+            )
+            total_selected = stage_share["days"].sum()
+            st.caption(
+                f"Slices show each stage's {stat_choice.lower()} duration as a share of "
+                f"the three stages combined ({total_selected:.1f} days; mean total "
+                f"shipping time {total_lead_mean:.1f} days). Shipping (carrier → "
+                "customer) is the dominant stage. Toggle switches every slice between "
+                f"the mean and the median stage duration. Excluded {excluded_share:.1f}% "
+                "of orders with a negative stage duration (inconsistent timestamps) and "
+                "any order missing one of the four timestamps."
+            )
+
+    with row1_right:
+        with st.container(border=True):
+            boxed_label("Mean review score")
+            shipping_review_display = shipping_review.assign(
+                shipping_bucket=shipping_review["shipping_bucket"].astype(str)
+            )
+            shipping_line = alt.Chart(shipping_review_display).mark_line(
+                point=True, color="#EF7C00"
+            ).encode(
+                x=alt.X(
+                    "shipping_bucket:N",
+                    title="Shipping time (days, carrier → customer)",
+                    sort=["0–3", "3–7", "7–14", "14–21", "21–30", "30+"],
+                ),
+                y=alt.Y("mean_review_score:Q", title="Mean review score", scale=alt.Scale(domain=[1, 5])),
+                tooltip=[
+                    alt.Tooltip("shipping_bucket:N", title="Shipping days"),
+                    alt.Tooltip("mean_review_score:Q", title="Mean review score", format=".2f"),
+                    alt.Tooltip("orders:Q", title="Orders", format=","),
+                ],
+            )
+            st.altair_chart(shipping_line.properties(height=340), use_container_width=True)
+            st.caption(
+                f"Delivered orders with a review; negative-duration rows already excluded "
+                f"({excluded_share:.1f}%). Buckets are days, right-open."
+            )
+
+    with st.container(border=True):
+        boxed_label("Geographic distance")
+        dist_left, dist_right = st.columns(2)
+        with dist_left:
+            st.markdown("###### Mean delivery days by customer–seller distance")
+            dist_days = alt.Chart(distance_buckets).mark_bar(color="#003D7C").encode(
+                x=alt.X(
+                    "distance_label:N",
+                    title="Distance (km)",
+                    sort=distance_buckets["distance_label"].tolist(),
+                ),
+                y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+                tooltip=[
+                    alt.Tooltip("distance_label:N", title="Distance (km)"),
+                    alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+                    alt.Tooltip("orders:Q", title="Orders", format=","),
+                ],
+            )
+            st.altair_chart(dist_days.properties(height=300), use_container_width=True)
+        with dist_right:
+            st.markdown("###### Mean review score & late-rate by distance")
+            base = alt.Chart(distance_buckets).encode(
+                x=alt.X(
+                    "distance_label:N",
+                    title="Distance (km)",
+                    sort=distance_buckets["distance_label"].tolist(),
+                )
+            )
+            score_line = base.mark_line(point=True, color="#EF7C00").encode(
+                y=alt.Y("mean_review_score:Q", title="Mean review score", scale=alt.Scale(domain=[1, 5])),
+                tooltip=[
+                    alt.Tooltip("distance_label:N", title="Distance (km)"),
+                    alt.Tooltip("mean_review_score:Q", title="Mean review score", format=".2f"),
+                    alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+                ],
+            )
+            late_line = base.mark_line(point=True, color="#003D7C", strokeDash=[4, 3]).encode(
+                y=alt.Y("late_rate:Q", title="Late rate (%)"),
+            )
+            st.altair_chart(
+                alt.layer(score_line, late_line).resolve_scale(y="independent").properties(height=300),
+                use_container_width=True,
+            )
+        st.caption(
+            "Distance is a haversine km between customer and seller zip-prefix "
+            f"centroids (mean lat/lng per prefix from the geolocation table), not exact "
+            f"addresses. Dropped {dropped_share:.1f}% of delivered orders whose customer "
+            "or seller zip prefix is absent from the geolocation table. Buckets are "
+            "sextiles of distance. Orange = review score (left axis), dashed blue = "
+            "late rate (right axis)."
+        )
+
+    with st.container(border=True):
+        boxed_label("Category")
+        cat_left, cat_right = st.columns(2)
+        with cat_left:
+            st.markdown("###### Mean delivery days")
+            cat_days = alt.Chart(top_categories).mark_bar(color="#003D7C").encode(
+                y=alt.Y("product_category_name_english:N", title=None, sort=category_order),
+                x=alt.X("mean_delivery_days:Q", title="Mean delivery days"),
+                tooltip=[
+                    alt.Tooltip("product_category_name_english:N", title="Category"),
+                    alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+                    alt.Tooltip("orders:Q", title="Orders", format=","),
+                ],
+            )
+            st.altair_chart(cat_days.properties(height=380), use_container_width=True)
+        with cat_right:
+            st.markdown("###### Mean review score")
+            cat_score = alt.Chart(top_categories).mark_bar(color="#EF7C00").encode(
+                y=alt.Y(
+                    "product_category_name_english:N",
+                    title=None,
+                    sort=category_order,
+                    axis=alt.Axis(labels=False),
+                ),
+                x=alt.X("mean_review_score:Q", title="Mean review score", scale=alt.Scale(domain=[1, 5])),
+                tooltip=[
+                    alt.Tooltip("product_category_name_english:N", title="Category"),
+                    alt.Tooltip("mean_review_score:Q", title="Mean review score", format=".2f"),
+                    alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+                ],
+            )
+            st.altair_chart(cat_score.properties(height=380), use_container_width=True)
+        st.caption(
+            "Categories with ≥100 delivered orders, top 13 by mean delivery time. Same "
+            "row order in both charts. Late rate = share delivered after the estimated "
+            "date (`is_on_time` from the consolidated file). One row per (order, category)."
+        )
+
+    with st.container(border=True):
+        boxed_label("Seller volume size")
+        seller_scatter = alt.Chart(seller_cuts).mark_circle(opacity=0.55).encode(
+            x=alt.X("orders:Q", title="Delivered orders", scale=alt.Scale(type="log")),
+            y=alt.Y("late_rate:Q", title="Late rate (%)"),
+            size=alt.Size("orders:Q", title="Orders", legend=None),
+            color=alt.Color(
+                "volume_band:N",
+                title=None,
+                scale=alt.Scale(
+                    domain=["Top-decile volume", "Other sellers"],
+                    range=["#EF7C00", "#003D7C"],
+                ),
+            ),
+            tooltip=[
+                alt.Tooltip("seller_id:N", title="Seller"),
+                alt.Tooltip("orders:Q", title="Orders", format=","),
+                alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+                alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+                alt.Tooltip("mean_review_score:Q", title="Mean review score", format=".2f"),
+            ],
+        )
+        st.altair_chart(seller_scatter.properties(height=340), use_container_width=True)
+        st.caption(
+            f"Sellers with ≥20 delivered orders. Orange = top-decile volume "
+            f"(≥{volume_threshold:.0f} orders); x-axis log-scaled. Marker size also "
+            "encodes order volume. Late rate from `is_on_time` in the consolidated "
+            "file. One row per (order, seller)."
+        )

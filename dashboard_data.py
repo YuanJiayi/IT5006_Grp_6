@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -144,6 +145,251 @@ def build_delivery_review_analysis(order_data: pd.DataFrame, reviews: pd.DataFra
     data["lateness_band"] = pd.cut(data["days_late"], [-float("inf"), 0, 3, 7, float("inf")], labels=["On time or early", "1–3 days late", "4–7 days late", "8+ days late"])
     severity = data.groupby("lateness_band", observed=True, as_index=False)["low_rating"].mean().assign(low_rating_rate=lambda frame: frame["low_rating"] * 100)
     return comparison, severity, risk_ratio
+
+
+# ---------------------------------------------------------------------------
+# Delivery correlations tab
+# ---------------------------------------------------------------------------
+
+LEAD_STAGES = ["processing_time", "handling_time", "shipping_time"]
+LEAD_STAGE_LABELS = {
+    "processing_time": "Processing (purchase → approval)",
+    "handling_time": "Handling (approval → carrier)",
+    "shipping_time": "Shipping (carrier → customer)",
+}
+
+
+@st.cache_data
+def load_order_stage_timestamps(path: Path) -> pd.DataFrame:
+    """Approval / carrier timestamps live only in the raw orders file, not the
+    consolidated line-item CSV, so they are pulled straight from here."""
+    return pd.read_csv(
+        path,
+        usecols=[
+            "order_id",
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+        ],
+        parse_dates=[
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+        ],
+    )
+
+
+def _order_review_scores(reviews_path: Path) -> pd.DataFrame:
+    return latest_reviews(load_reviews(reviews_path))[["order_id", "review_score"]]
+
+
+@st.cache_data
+def build_leadtime_decomposition(
+    orders_path: Path, reviews_path: Path
+) -> tuple[pd.DataFrame, pd.DataFrame, float, float]:
+    stages = load_order_stage_timestamps(orders_path).dropna(
+        subset=[
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+        ]
+    )
+    stages["processing_time"] = (
+        stages["order_approved_at"] - stages["order_purchase_timestamp"]
+    ).dt.total_seconds() / 86_400
+    stages["handling_time"] = (
+        stages["order_delivered_carrier_date"] - stages["order_approved_at"]
+    ).dt.total_seconds() / 86_400
+    stages["shipping_time"] = (
+        stages["order_delivered_customer_date"] - stages["order_delivered_carrier_date"]
+    ).dt.total_seconds() / 86_400
+
+    valid = (stages[LEAD_STAGES] >= 0).all(axis=1)
+    excluded_share = float((~valid).mean() * 100)
+    clean = stages.loc[valid].copy()
+    clean["total_time"] = clean[LEAD_STAGES].sum(axis=1)
+    total_mean = float(clean["total_time"].mean())
+
+    summary = pd.DataFrame(
+        {
+            "stage": [LEAD_STAGE_LABELS[key] for key in LEAD_STAGES],
+            "stage_key": LEAD_STAGES,
+            "mean_days": [clean[key].mean() for key in LEAD_STAGES],
+            "median_days": [clean[key].median() for key in LEAD_STAGES],
+        }
+    )
+    summary["share_pct"] = summary["mean_days"] / total_mean * 100
+
+    scored = clean.merge(_order_review_scores(reviews_path), on="order_id", how="inner")
+    scored["shipping_bucket"] = pd.cut(
+        scored["shipping_time"],
+        bins=[0, 3, 7, 14, 21, 30, float("inf")],
+        labels=["0–3", "3–7", "7–14", "14–21", "21–30", "30+"],
+        include_lowest=True,
+    )
+    shipping_review = (
+        scored.groupby("shipping_bucket", observed=True, as_index=False)
+        .agg(mean_review_score=("review_score", "mean"), orders=("order_id", "size"))
+    )
+    return summary, shipping_review, excluded_share, total_mean
+
+
+@st.cache_data
+def load_zip_centroids(path: Path) -> pd.DataFrame:
+    geo = pd.read_csv(
+        path,
+        usecols=["geolocation_zip_code_prefix", "geolocation_lat", "geolocation_lng"],
+    )
+    return geo.groupby("geolocation_zip_code_prefix", as_index=False).agg(
+        lat=("geolocation_lat", "mean"), lng=("geolocation_lng", "mean")
+    )
+
+
+def _haversine_km(lat1, lng1, lat2, lng2):
+    radius = 6371.0
+    lat1, lng1, lat2, lng2 = map(np.radians, [lat1, lng1, lat2, lng2])
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    inner = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlng / 2) ** 2
+    return 2 * radius * np.arcsin(np.sqrt(inner))
+
+
+@st.cache_data
+def build_distance_table(
+    consolidated_path: Path,
+    customers_path: Path,
+    sellers_path: Path,
+    geo_path: Path,
+    reviews_path: Path,
+) -> tuple[pd.DataFrame, float]:
+    orders = eligible_deliveries(load_data(consolidated_path).drop_duplicates("order_id"))[
+        [
+            "order_id",
+            "customer_id",
+            "seller_id",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+            "delivery_days",
+        ]
+    ]
+    customers = pd.read_csv(
+        customers_path, usecols=["customer_id", "customer_zip_code_prefix"]
+    )
+    sellers = pd.read_csv(sellers_path, usecols=["seller_id", "seller_zip_code_prefix"])
+    centroids = load_zip_centroids(geo_path)
+
+    merged = orders.merge(customers, on="customer_id", how="left").merge(
+        sellers, on="seller_id", how="left"
+    )
+    total = len(merged)
+    merged = merged.merge(
+        centroids.rename(
+            columns={
+                "geolocation_zip_code_prefix": "customer_zip_code_prefix",
+                "lat": "cust_lat",
+                "lng": "cust_lng",
+            }
+        ),
+        on="customer_zip_code_prefix",
+        how="left",
+    ).merge(
+        centroids.rename(
+            columns={
+                "geolocation_zip_code_prefix": "seller_zip_code_prefix",
+                "lat": "sell_lat",
+                "lng": "sell_lng",
+            }
+        ),
+        on="seller_zip_code_prefix",
+        how="left",
+    )
+    located = merged.dropna(subset=["cust_lat", "sell_lat"]).copy()
+    dropped_share = float((1 - len(located) / total) * 100) if total else 0.0
+    located["distance_km"] = _haversine_km(
+        located["cust_lat"], located["cust_lng"], located["sell_lat"], located["sell_lng"]
+    )
+    located["is_late"] = (
+        located["order_delivered_customer_date"]
+        > located["order_estimated_delivery_date"]
+    )
+    located = located.merge(_order_review_scores(reviews_path), on="order_id", how="left")
+    return (
+        located[["order_id", "distance_km", "delivery_days", "is_late", "review_score"]],
+        dropped_share,
+    )
+
+
+def build_distance_buckets(distance_table: pd.DataFrame) -> pd.DataFrame:
+    data = distance_table.dropna(subset=["distance_km", "delivery_days"]).copy()
+    data["distance_bucket"] = pd.qcut(data["distance_km"], 6, duplicates="drop")
+    grouped = (
+        data.groupby("distance_bucket", observed=True)
+        .agg(
+            mean_delivery_days=("delivery_days", "mean"),
+            mean_review_score=("review_score", "mean"),
+            late_rate=("is_late", "mean"),
+            orders=("order_id", "size"),
+        )
+        .reset_index()
+    )
+    grouped["late_rate"] *= 100
+    grouped["distance_label"] = grouped["distance_bucket"].apply(
+        lambda interval: f"{max(interval.left, 0):,.0f}–{interval.right:,.0f}"
+    )
+    return grouped
+
+
+def _delivery_review_cut(
+    consolidated_path: Path, reviews_path: Path, group_columns: list[str]
+) -> pd.DataFrame:
+    items = eligible_deliveries(load_data(consolidated_path))
+    keep = list(dict.fromkeys([*group_columns, "order_id", "delivery_days", "is_on_time"]))
+    pairs = items[keep].dropna(subset=group_columns).drop_duplicates(
+        [*group_columns, "order_id"]
+    )
+    pairs = pairs.merge(_order_review_scores(reviews_path), on="order_id", how="left")
+    pairs["is_late"] = ~pairs["is_on_time"].astype(bool)
+    grouped = (
+        pairs.groupby(group_columns)
+        .agg(
+            orders=("order_id", "nunique"),
+            mean_delivery_days=("delivery_days", "mean"),
+            mean_review_score=("review_score", "mean"),
+            late_rate=("is_late", "mean"),
+        )
+        .reset_index()
+    )
+    grouped["late_rate"] *= 100
+    return grouped
+
+
+@st.cache_data
+def build_category_cuts(
+    consolidated_path: Path, reviews_path: Path, min_orders: int = 100
+) -> pd.DataFrame:
+    grouped = _delivery_review_cut(
+        consolidated_path, reviews_path, ["product_category_name_english"]
+    )
+    return (
+        grouped.loc[grouped["orders"] >= min_orders]
+        .sort_values("mean_delivery_days", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data
+def build_seller_cuts(
+    consolidated_path: Path, reviews_path: Path, min_orders: int = 20
+) -> pd.DataFrame:
+    grouped = _delivery_review_cut(consolidated_path, reviews_path, ["seller_id"])
+    return (
+        grouped.loc[grouped["orders"] >= min_orders]
+        .sort_values("orders", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 def build_retention_series(order_data: pd.DataFrame, granularity: str) -> tuple[pd.DataFrame, float]:
