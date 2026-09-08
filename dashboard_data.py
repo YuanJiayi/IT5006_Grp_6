@@ -486,3 +486,184 @@ def build_retention_series(order_data: pd.DataFrame, granularity: str) -> tuple[
     series = complete_periods(series, granularity)
     series["returning_customer_share"] = series["returning_customers"] / (series["new_customers"] + series["returning_customers"]).replace(0, pd.NA) * 100
     return series, repeat_rate
+
+
+# ---------------------------------------------------------------------------
+# Operational Capacity tab
+# ---------------------------------------------------------------------------
+
+DAY_OF_WEEK_ORDER = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+]
+
+
+def add_week_period(data: pd.DataFrame, date_column: str) -> pd.DataFrame:
+    return data.assign(period=data[date_column].dt.to_period("W").dt.start_time)
+
+
+@st.cache_data
+def build_capacity_series(order_data: pd.DataFrame) -> pd.DataFrame:
+    """Weekly order volume vs. mean/median delivery time, to spot capacity strain."""
+    delivered = trim_trend_window(eligible_deliveries(order_data), "order_purchase_timestamp")
+    weekly = (
+        add_week_period(delivered, "order_purchase_timestamp")
+        .groupby("period", as_index=False)
+        .agg(
+            orders=("order_id", "nunique"),
+            median_delivery_days=("delivery_days", "median"),
+            mean_delivery_days=("delivery_days", "mean"),
+        )
+        .sort_values("period")
+    )
+    return weekly
+
+
+@st.cache_data
+def build_hour_dow_heatmap(order_data: pd.DataFrame) -> pd.DataFrame:
+    """Mean delivery time by purchase day-of-week and hour-of-day."""
+    delivered = eligible_deliveries(order_data).assign(
+        purchase_hour=lambda frame: frame["order_purchase_timestamp"].dt.hour
+    )
+    grouped = delivered.groupby(["day_of_week", "purchase_hour"], as_index=False).agg(
+        mean_delivery_days=("delivery_days", "mean"), orders=("order_id", "size")
+    )
+    return grouped
+
+
+@st.cache_data
+def build_freight_ratio_buckets(line_items: pd.DataFrame, buckets: int = 6) -> pd.DataFrame:
+    """Freight-to-price ratio (order-level) vs. late-delivery rate."""
+    order_economics = line_items.groupby("order_id", as_index=False).agg(
+        price_sum=("price", "sum"), freight_sum=("freight_value", "sum")
+    )
+    order_status_cols = line_items.drop_duplicates("order_id")[
+        [
+            "order_id",
+            "order_status",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+            "is_on_time",
+        ]
+    ]
+    merged = order_economics.merge(order_status_cols, on="order_id", how="left")
+    eligible = eligible_deliveries(merged)
+    eligible = eligible.loc[eligible["price_sum"] > 0].copy()
+    eligible["freight_ratio"] = eligible["freight_sum"] / eligible["price_sum"]
+    eligible["late"] = ~eligible["is_on_time"].astype(bool)
+    eligible["ratio_bucket"] = pd.qcut(eligible["freight_ratio"], buckets, duplicates="drop")
+
+    grouped = (
+        eligible.groupby("ratio_bucket", observed=True)
+        .agg(
+            mean_ratio=("freight_ratio", "mean"),
+            late_rate=("late", "mean"),
+            orders=("order_id", "size"),
+        )
+        .reset_index()
+    )
+    grouped["late_rate"] *= 100
+    grouped["ratio_label"] = grouped["ratio_bucket"].apply(
+        lambda interval: f"{max(interval.left, 0):.2f}-{interval.right:.2f}"
+    )
+    return grouped
+
+
+@st.cache_data
+def build_backlog_series(order_data: pd.DataFrame) -> pd.DataFrame:
+    """Cumulative gap between orders placed and orders delivered, as a backlog proxy."""
+    delivered = trim_trend_window(eligible_deliveries(order_data), "order_purchase_timestamp")
+    placed = add_week_period(delivered, "order_purchase_timestamp").groupby("period").size()
+    placed.name = "placed"
+    completed = add_week_period(delivered, "order_delivered_customer_date").groupby("period").size()
+    completed.name = "completed"
+
+    combined = pd.concat([placed, completed], axis=1).fillna(0)
+    full_index = pd.date_range(combined.index.min(), combined.index.max(), freq="W-MON")
+    combined = combined.reindex(full_index, fill_value=0)
+    combined.index.name = "period"
+    combined = combined.reset_index()
+    combined["backlog"] = (combined["placed"] - combined["completed"]).cumsum()
+    return combined
+
+
+@st.cache_data
+def build_promise_buffer_series(order_data: pd.DataFrame) -> pd.DataFrame:
+    """Weekly mean promised (estimated) vs. actual delivery days, to see whether
+    Olist's own delivery-date promise reacts to capacity strain/backlog."""
+    delivered = trim_trend_window(eligible_deliveries(order_data), "order_purchase_timestamp")
+    delivered = delivered.assign(
+        promised_days=lambda frame: (
+            frame["order_estimated_delivery_date"] - frame["order_purchase_timestamp"]
+        ).dt.total_seconds() / 86_400,
+        actual_days=lambda frame: (
+            frame["order_delivered_customer_date"] - frame["order_purchase_timestamp"]
+        ).dt.total_seconds() / 86_400,
+        late=lambda frame: frame["order_delivered_customer_date"] > frame["order_estimated_delivery_date"],
+    )
+    weekly = add_week_period(delivered, "order_purchase_timestamp").groupby(
+        "period", as_index=False
+    ).agg(
+        orders=("order_id", "size"),
+        mean_promised_days=("promised_days", "mean"),
+        mean_actual_days=("actual_days", "mean"),
+        late_rate=("late", "mean"),
+    )
+    weekly["buffer_days"] = weekly["mean_promised_days"] - weekly["mean_actual_days"]
+    weekly["late_rate"] *= 100
+    return weekly
+
+
+def _clean_stage_durations(orders_path: Path) -> pd.DataFrame:
+    """Per-order stage durations with missing-timestamp and negative-duration rows dropped.
+    Reuses load_order_stage_timestamps() defined above for the Decomposition chart."""
+    stages = load_order_stage_timestamps(orders_path).dropna(
+        subset=[
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+        ]
+    )
+    stages["processing_time"] = (
+        stages["order_approved_at"] - stages["order_purchase_timestamp"]
+    ).dt.total_seconds() / 86_400
+    stages["handling_time"] = (
+        stages["order_delivered_carrier_date"] - stages["order_approved_at"]
+    ).dt.total_seconds() / 86_400
+    stages["shipping_time"] = (
+        stages["order_delivered_customer_date"] - stages["order_delivered_carrier_date"]
+    ).dt.total_seconds() / 86_400
+
+    valid = (stages[LEAD_STAGES] >= 0).all(axis=1)
+    return stages.loc[valid].copy()
+
+
+@st.cache_data
+def build_stage_duration_series(orders_path: Path) -> pd.DataFrame:
+    """Weekly mean/median duration of each fulfilment stage, to see which stage degrades under load."""
+    clean = trim_trend_window(_clean_stage_durations(orders_path), "order_purchase_timestamp")
+
+    grouped = add_week_period(clean, "order_purchase_timestamp").groupby("period", as_index=False)
+    mean_weekly = grouped[LEAD_STAGES].mean().melt(
+        id_vars="period", value_vars=LEAD_STAGES, var_name="stage_key", value_name="mean_days"
+    )
+    median_weekly = grouped[LEAD_STAGES].median().melt(
+        id_vars="period", value_vars=LEAD_STAGES, var_name="stage_key", value_name="median_days"
+    )
+    long = mean_weekly.merge(median_weekly, on=["period", "stage_key"])
+    long["stage"] = long["stage_key"].map(LEAD_STAGE_LABELS)
+    return long
+
+
+@st.cache_data
+def build_stage_duration_by_weekday(orders_path: Path) -> pd.DataFrame:
+    """Mean duration of each fulfilment stage by the day-of-week the order was purchased."""
+    clean = _clean_stage_durations(orders_path)
+    clean["day_of_week"] = clean["order_purchase_timestamp"].dt.day_name()
+
+    by_weekday = clean.groupby("day_of_week", as_index=False)[LEAD_STAGES].mean()
+    long = by_weekday.melt(
+        id_vars="day_of_week", value_vars=LEAD_STAGES, var_name="stage_key", value_name="mean_days"
+    )
+    long["stage"] = long["stage_key"].map(LEAD_STAGE_LABELS)
+    return long

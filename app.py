@@ -7,17 +7,25 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_data import (
+    build_backlog_series,
+    build_capacity_series,
     build_category_cuts,
     build_commercial_series,
     build_delivery_experience_series,
     build_delivery_review_analysis,
     build_distance_buckets,
     build_distance_table,
+    build_freight_ratio_buckets,
     build_growth_series,
+    build_hour_dow_heatmap,
     build_leadtime_decomposition,
     build_payment_cuts,
     build_payment_stage_breakdown,
+    build_promise_buffer_series,
     build_seller_cuts,
+    build_stage_duration_by_weekday,
+    build_stage_duration_series,
+    DAY_OF_WEEK_ORDER,
     eligible_deliveries,
     latest_reviews as select_latest_reviews,
     load_customer_ids,
@@ -67,8 +75,8 @@ def line_chart(
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-overview_tab, delivery_correlations_tab = st.tabs(
-    ["Overview", "Delivery correlations"]
+overview_tab, delivery_correlations_tab, capacity_tab = st.tabs(
+    ["Overview", "Delivery correlations", "Operational Capacity"]
 )
 
 with overview_tab:
@@ -971,3 +979,267 @@ with delivery_correlations_tab:
             "into one overall summary. Same exclusions as Decomposition (negative "
             "duration or missing timestamps)."
         )
+with capacity_tab:
+    capacity_required = [DATA_PATH, ORDERS_PATH]
+    if not all(path.exists() for path in capacity_required):
+        st.error("Required data files for this tab could not be found in the `data` folder.")
+        st.stop()
+
+    st.caption(
+        "Trend charts show January 2017 to August 2018, excluding launch and partial "
+        "boundary periods. `order_approved_at` / `order_delivered_carrier_date` are read "
+        "from `olist_orders_dataset.csv` (absent from the consolidated file) and merged "
+        "on `order_id`."
+    )
+
+    capacity_line_items = load_data(DATA_PATH)
+    capacity_orders = capacity_line_items.drop_duplicates("order_id")
+
+    st.subheader("Capacity strain: weekly order volume vs. delivery time")
+    capacity_stat_choice = st.radio(
+        "Value used for delivery time",
+        ["Median", "Mean"],
+        horizontal=True,
+        key="capacity_stat",
+    )
+    capacity_value_column = {"Median": "median_delivery_days", "Mean": "mean_delivery_days"}[
+        capacity_stat_choice
+    ]
+    capacity_series = build_capacity_series(capacity_orders)
+    capacity_base = alt.Chart(capacity_series).encode(x=alt.X("period:T", title=None))
+    volume_bars = capacity_base.mark_bar(color="#7FA9D0").encode(
+        y=alt.Y("orders:Q", title="Orders placed"),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+            alt.Tooltip(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days", format=".1f"),
+        ],
+    )
+    lead_time_line = capacity_base.mark_line(color="#EF7C00", point=True).encode(
+        y=alt.Y(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days")
+    )
+    st.altair_chart(
+        alt.layer(volume_bars, lead_time_line).resolve_scale(y="independent").properties(height=320),
+        use_container_width=True,
+    )
+    st.caption(
+        f"Weekly order volume (bars, left axis) vs. {capacity_stat_choice.lower()} delivery "
+        "time (orange line, right axis). If lead time rises alongside volume spikes, delay "
+        "is partly a capacity/throughput problem, not just a per-order attribute."
+    )
+
+    st.subheader("Purchase timing: day-of-week × hour heatmap")
+    heatmap_metric_choice = st.radio(
+        "Colour by",
+        ["Mean delivery days", "Order volume"],
+        horizontal=True,
+        key="heatmap_metric",
+    )
+    heatmap_metric_column = {"Mean delivery days": "mean_delivery_days", "Order volume": "orders"}[
+        heatmap_metric_choice
+    ]
+    heatmap_data = build_hour_dow_heatmap(capacity_orders)
+    heatmap_chart = alt.Chart(heatmap_data).mark_rect().encode(
+        x=alt.X("purchase_hour:O", title="Purchase hour"),
+        y=alt.Y("day_of_week:N", title=None, sort=DAY_OF_WEEK_ORDER),
+        color=alt.Color(
+            f"{heatmap_metric_column}:Q",
+            title=heatmap_metric_choice,
+            scale=alt.Scale(scheme="blues"),
+        ),
+        tooltip=[
+            alt.Tooltip("day_of_week:N", title="Day"),
+            alt.Tooltip("purchase_hour:O", title="Hour"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    st.altair_chart(heatmap_chart.properties(height=320), use_container_width=True)
+    st.caption(
+        "Colour toggle switches between mean delivery days and order volume by the "
+        "day-of-week and hour of the purchase timestamp. Purchase timing is known at "
+        "order time, making it a zero-cost candidate feature."
+    )
+
+    st.subheader("Which stage slows down for weekend purchases?")
+    weekday_stage = build_stage_duration_by_weekday(ORDERS_PATH)
+    stage_key_order = ["processing_time", "handling_time", "shipping_time"]
+    stage_key_colors = dict(zip(stage_key_order, ["#EF7C00", "#003D7C", "#7FA9D0"]))
+    stage_key_labels = dict(zip(stage_key_order, weekday_stage.drop_duplicates("stage_key").set_index("stage_key")["stage"]))
+    weekday_cols = st.columns(3)
+    for col, stage_key in zip(weekday_cols, stage_key_order):
+        stage_data = weekday_stage.loc[weekday_stage["stage_key"] == stage_key]
+        with col:
+            st.markdown(f"###### {stage_key_labels[stage_key]}")
+            stage_bar = alt.Chart(stage_data).mark_bar(color=stage_key_colors[stage_key]).encode(
+                x=alt.X("day_of_week:N", title=None, sort=DAY_OF_WEEK_ORDER, axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("mean_days:Q", title="Mean days"),
+                tooltip=[
+                    alt.Tooltip("day_of_week:N", title="Purchase day"),
+                    alt.Tooltip("mean_days:Q", title="Mean days", format=".2f"),
+                ],
+            )
+            st.altair_chart(stage_bar.properties(height=260), use_container_width=True)
+    st.caption(
+        "Mean duration of each fulfilment stage by the day-of-week the order was "
+        "purchased (each stage has its own y-axis, since shipping is ~20x longer than "
+        "processing). Tests whether the day-of-week effect seen above sits specifically "
+        "in one stage (e.g. weekend purchases queuing before approval) rather than "
+        "being spread evenly across the pipeline. Negative-duration and incomplete-"
+        "timestamp rows excluded, same as the stage-duration chart below."
+    )
+
+    st.subheader("Freight cost efficiency: freight-to-price ratio vs. late-rate")
+    freight_buckets = build_freight_ratio_buckets(capacity_line_items)
+    freight_base = alt.Chart(freight_buckets).encode(
+        x=alt.X("ratio_label:N", title="Freight ÷ price", sort=freight_buckets["ratio_label"].tolist())
+    )
+    freight_bars = freight_base.mark_bar(color="#7FA9D0").encode(
+        y=alt.Y("late_rate:Q", title="Late-delivery rate (%)"),
+        tooltip=[
+            alt.Tooltip("ratio_label:N", title="Freight ÷ price"),
+            alt.Tooltip("late_rate:Q", title="Late-delivery rate (%)", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    st.altair_chart(freight_bars.properties(height=300), use_container_width=True)
+    st.caption(
+        "Orders bucketed into sextiles of (order-level freight value ÷ price). Late-rate "
+        "stays roughly flat across buckets (about 7.8-8.4%), so despite bundling "
+        "distance, weight and carrier pricing into one number, this ratio alone isn't a "
+        "strong standalone predictor of lateness."
+    )
+
+    st.subheader("Backlog: orders placed vs. delivered over time")
+    backlog_series = build_backlog_series(capacity_orders)
+    backlog_chart = alt.Chart(backlog_series).mark_area(
+        color="#EF7C00", opacity=0.6, line={"color": "#EF7C00"}
+    ).encode(
+        x=alt.X("period:T", title=None),
+        y=alt.Y("backlog:Q", title="Cumulative backlog (orders)"),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("placed:Q", title="Orders placed", format=","),
+            alt.Tooltip("completed:Q", title="Orders delivered", format=","),
+            alt.Tooltip("backlog:Q", title="Cumulative backlog", format=","),
+        ],
+    )
+    st.altair_chart(backlog_chart.properties(height=300), use_container_width=True)
+    st.caption(
+        "Cumulative (orders placed − orders delivered) by week. Caveat: the final few "
+        "weeks are inflated by right-censoring, since recently placed orders haven't had "
+        "time to be delivered yet as of the data snapshot. That's not the same as a real "
+        "operational backlog."
+    )
+
+    st.subheader("Does Olist's own delivery promise react to capacity strain?")
+    promise_secondary_choice = st.radio(
+        "Secondary axis",
+        ["Late-delivery rate", "Backlog"],
+        horizontal=True,
+        key="promise_secondary",
+    )
+    promise_series = build_promise_buffer_series(capacity_orders)
+    promise_series = promise_series.merge(
+        backlog_series[["period", "backlog"]], on="period", how="left"
+    )
+    promise_long = promise_series.melt(
+        id_vars=["period", "orders", "buffer_days", "late_rate", "backlog"],
+        value_vars=["mean_promised_days", "mean_actual_days"],
+        var_name="series",
+        value_name="days",
+    )
+    promise_long["series"] = promise_long["series"].map(
+        {"mean_promised_days": "Promised (estimated delivery date)", "mean_actual_days": "Actual"}
+    )
+    promise_base = alt.Chart(promise_long).encode(x=alt.X("period:T", title=None))
+    promise_lines = promise_base.mark_line(point=True).encode(
+        y=alt.Y("days:Q", title="Mean days from purchase"),
+        color=alt.Color(
+            "series:N",
+            title=None,
+            scale=alt.Scale(
+                domain=["Promised (estimated delivery date)", "Actual"],
+                range=["#7FA9D0", "#EF7C00"],
+            ),
+            legend=alt.Legend(orient="bottom"),
+        ),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("series:N", title="Series"),
+            alt.Tooltip("days:Q", title="Mean days", format=".1f"),
+        ],
+    )
+    promise_secondary_column = {
+        "Late-delivery rate": "late_rate",
+        "Backlog": "backlog",
+    }[promise_secondary_choice]
+    promise_secondary_title = {
+        "Late-delivery rate": "Late-delivery rate (%)",
+        "Backlog": "Cumulative backlog (orders)",
+    }[promise_secondary_choice]
+    secondary_line = alt.Chart(promise_series).mark_line(
+        point=True, color="#003D7C", strokeDash=[4, 3]
+    ).encode(
+        x=alt.X("period:T", title=None),
+        y=alt.Y(f"{promise_secondary_column}:Q", title=promise_secondary_title),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip(f"{promise_secondary_column}:Q", title=promise_secondary_title, format=".1f"),
+        ],
+    )
+    st.altair_chart(
+        alt.layer(promise_lines, secondary_line).resolve_scale(y="independent").properties(height=340),
+        use_container_width=True,
+    )
+    st.caption(
+        "Mean promised (order_estimated_delivery_date minus purchase timestamp) vs. "
+        "actual delivery days (left axis), plus the toggled secondary metric (dashed "
+        "dark-blue line, right axis), by week. The promised window tends to widen with "
+        "a lag after volume spikes (it barely moves during the Nov 2017 peak week itself, "
+        "but keeps climbing for weeks afterward). It correlates more with a several-week "
+        "trailing average of actual delivery performance (r≈0.45 at 8-12 weeks) than "
+        "with current-week backlog (r=-0.26), suggesting a slow-reacting historical "
+        "baseline rather than a live capacity signal. Watch whether late-rate falls as "
+        "the promise widens: since the late/on-time label is defined relative to this "
+        "promise, a wider promise can lower the late-rate even if actual delivery isn't "
+        "getting faster."
+    )
+
+    st.subheader("Where does the delay accumulate? Stage duration over time")
+    stage_series_stat_choice = st.radio(
+        "Value used for stage duration",
+        ["Mean", "Median"],
+        horizontal=True,
+        key="stage_series_stat",
+    )
+    stage_series_value_column = {"Mean": "mean_days", "Median": "median_days"}[stage_series_stat_choice]
+    stage_series = build_stage_duration_series(ORDERS_PATH)
+    stage_order = list(dict.fromkeys(stage_series.sort_values("period")["stage"]))
+    stage_area = alt.Chart(stage_series).mark_area().encode(
+        x=alt.X("period:T", title=None),
+        y=alt.Y(
+            f"{stage_series_value_column}:Q",
+            title=f"{stage_series_stat_choice} stage duration (days)",
+            stack="zero",
+        ),
+        color=alt.Color(
+            "stage:N",
+            title=None,
+            sort=stage_order,
+            scale=alt.Scale(range=["#EF7C00", "#003D7C", "#7FA9D0"]),
+            legend=alt.Legend(orient="bottom", columns=1),
+        ),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("stage:N", title="Stage"),
+            alt.Tooltip(f"{stage_series_value_column}:Q", title=f"{stage_series_stat_choice} days", format=".2f"),
+        ],
+    )
+    st.altair_chart(stage_area.properties(height=340), use_container_width=True)
+    st.caption(
+        f"Weekly {stage_series_stat_choice.lower()} duration of each fulfilment stage, "
+        "stacked. Shows whether backlog during high-volume periods concentrates in a "
+        "specific stage (e.g. warehouse hand-off vs. carrier transit) rather than "
+        "spreading evenly. Negative-duration and incomplete-timestamp rows excluded."
+    )
