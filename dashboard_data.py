@@ -392,6 +392,81 @@ def build_seller_cuts(
     )
 
 
+@st.cache_data
+def load_primary_payment_types(path: Path) -> pd.DataFrame:
+    """An order can have more than one payment row (e.g. a voucher topped up
+    with a card); `payment_sequential == 1` is Olist's primary payment record —
+    same convention used in the Phase 1 EDA notebook for this exact reason."""
+    payments = pd.read_csv(path, usecols=["order_id", "payment_sequential", "payment_type"])
+    return payments.loc[payments["payment_sequential"].eq(1), ["order_id", "payment_type"]]
+
+
+@st.cache_data
+def build_payment_cuts(
+    consolidated_path: Path, payments_path: Path, reviews_path: Path, min_orders: int = 50
+) -> pd.DataFrame:
+    orders = eligible_deliveries(load_data(consolidated_path)).drop_duplicates("order_id")
+    orders = orders.merge(load_primary_payment_types(payments_path), on="order_id", how="inner")
+    orders = orders.merge(_order_review_scores(reviews_path), on="order_id", how="left")
+    orders["is_late"] = (
+        orders["order_delivered_customer_date"] > orders["order_estimated_delivery_date"]
+    )
+    grouped = orders.groupby("payment_type", as_index=False).agg(
+        orders=("order_id", "size"),
+        mean_delivery_days=("delivery_days", "mean"),
+        mean_review_score=("review_score", "mean"),
+        late_rate=("is_late", "mean"),
+    )
+    grouped["late_rate"] *= 100
+    return (
+        grouped.loc[grouped["orders"] >= min_orders]
+        .sort_values("orders", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data
+def build_payment_stage_breakdown(orders_path: Path, payments_path: Path) -> pd.DataFrame:
+    """Same processing/handling/shipping stages as `build_leadtime_decomposition`,
+    grouped by payment type instead of collapsed to one overall summary."""
+    stages = load_order_stage_timestamps(orders_path).dropna(
+        subset=[
+            "order_purchase_timestamp",
+            "order_approved_at",
+            "order_delivered_carrier_date",
+            "order_delivered_customer_date",
+        ]
+    )
+    stages["processing_time"] = (
+        stages["order_approved_at"] - stages["order_purchase_timestamp"]
+    ).dt.total_seconds() / 86_400
+    stages["handling_time"] = (
+        stages["order_delivered_carrier_date"] - stages["order_approved_at"]
+    ).dt.total_seconds() / 86_400
+    stages["shipping_time"] = (
+        stages["order_delivered_customer_date"] - stages["order_delivered_carrier_date"]
+    ).dt.total_seconds() / 86_400
+
+    valid = (stages[LEAD_STAGES] >= 0).all(axis=1)
+    clean = stages.loc[valid].merge(
+        load_primary_payment_types(payments_path), on="order_id", how="inner"
+    )
+
+    grouped = clean.groupby("payment_type", as_index=False).agg(
+        **{stage: (stage, "mean") for stage in LEAD_STAGES},
+        orders=("order_id", "size"),
+    )
+    long = grouped.melt(
+        id_vars=["payment_type", "orders"],
+        value_vars=LEAD_STAGES,
+        var_name="stage_key",
+        value_name="days",
+    )
+    long["stage"] = long["stage_key"].map(LEAD_STAGE_LABELS)
+    long["stage_order"] = long["stage_key"].map({stage: i for i, stage in enumerate(LEAD_STAGES)})
+    return long
+
+
 def build_retention_series(order_data: pd.DataFrame, granularity: str) -> tuple[pd.DataFrame, float]:
     customers = order_data.sort_values(["customer_unique_id", "order_purchase_timestamp", "order_id"]).copy()
     repeat_rate = customers.groupby("customer_unique_id")["order_id"].nunique().gt(1).mean()

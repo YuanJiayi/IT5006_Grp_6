@@ -15,6 +15,8 @@ from dashboard_data import (
     build_distance_table,
     build_growth_series,
     build_leadtime_decomposition,
+    build_payment_cuts,
+    build_payment_stage_breakdown,
     build_seller_cuts,
     eligible_deliveries,
     latest_reviews as select_latest_reviews,
@@ -29,6 +31,7 @@ REVIEWS_PATH = Path("data/olist_order_reviews_dataset.csv")
 ORDERS_PATH = Path("data/olist_orders_dataset.csv")
 SELLERS_PATH = Path("data/olist_sellers_dataset.csv")
 GEOLOCATION_PATH = Path("data/olist_geolocation_dataset.csv")
+PAYMENTS_PATH = Path("data/olist_order_payments_dataset.csv")
 BLUE = "#003D7C"
 ORANGE = "#EF7C00"
 
@@ -60,7 +63,6 @@ def line_chart(
         )
         .properties(height=340)
     )
-
 
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
@@ -594,6 +596,7 @@ with delivery_correlations_tab:
         SELLERS_PATH,
         GEOLOCATION_PATH,
         REVIEWS_PATH,
+        PAYMENTS_PATH,
     ]
     if not all(path.exists() for path in corr_required):
         st.error("Required data files for this tab could not be found in the `data` folder.")
@@ -624,6 +627,27 @@ with delivery_correlations_tab:
         volume_band=lambda frame: frame["orders"]
         .ge(volume_threshold)
         .map({True: "Top-decile volume", False: "Other sellers"})
+    )
+    payment_cuts = build_payment_cuts(DATA_PATH, PAYMENTS_PATH, REVIEWS_PATH, min_orders=50)
+    payment_order = payment_cuts["payment_type"].tolist()
+    payment_stages = build_payment_stage_breakdown(ORDERS_PATH, PAYMENTS_PATH)
+
+    # payment_cuts is already sorted by order count descending, so the first row
+    # is the most-used method — the natural baseline to compare the slowest against.
+    slowest_payment = payment_cuts.loc[payment_cuts["mean_delivery_days"].idxmax()]
+    common_payment = payment_cuts.iloc[0]
+    payment_stage_pivot = payment_stages.pivot(index="payment_type", columns="stage_key", values="days")
+    processing_gap = (
+        payment_stage_pivot.loc[slowest_payment["payment_type"], "processing_time"]
+        - payment_stage_pivot.loc[common_payment["payment_type"], "processing_time"]
+    )
+    handling_gap = (
+        payment_stage_pivot.loc[slowest_payment["payment_type"], "handling_time"]
+        - payment_stage_pivot.loc[common_payment["payment_type"], "handling_time"]
+    )
+    shipping_gap = (
+        payment_stage_pivot.loc[slowest_payment["payment_type"], "shipping_time"]
+        - payment_stage_pivot.loc[common_payment["payment_type"], "shipping_time"]
     )
 
     # Processing is a tiny slice, so it gets the high-contrast orange to pop;
@@ -875,4 +899,75 @@ with delivery_correlations_tab:
             f"(≥{volume_threshold:.0f} orders); x-axis log-scaled. Marker size also "
             "encodes order volume. Late rate from `is_on_time` in the consolidated "
             "file. One row per (order, seller)."
+        )
+
+    with st.container(border=True):
+        boxed_label("Payment method")
+        pay_left, pay_right = st.columns(2)
+        with pay_left:
+            st.markdown("###### Mean delivery days by payment method")
+            pay_days = alt.Chart(payment_cuts).mark_bar(color="#003D7C").encode(
+                x=alt.X("payment_type:N", title="Payment method", sort=payment_order),
+                y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+                tooltip=[
+                    alt.Tooltip("payment_type:N", title="Payment type"),
+                    alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+                    alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+                    alt.Tooltip("orders:Q", title="Orders", format=","),
+                ],
+            )
+            st.altair_chart(pay_days.properties(height=300), use_container_width=True)
+        with pay_right:
+            st.markdown("###### Mean review score & late-rate by payment method")
+            pay_base = alt.Chart(payment_cuts).encode(
+                x=alt.X("payment_type:N", title="Payment method", sort=payment_order)
+            )
+            pay_score_line = pay_base.mark_line(point=True, color="#EF7C00").encode(
+                y=alt.Y("mean_review_score:Q", title="Mean review score", scale=alt.Scale(domain=[1, 5])),
+                tooltip=[
+                    alt.Tooltip("payment_type:N", title="Payment type"),
+                    alt.Tooltip("mean_review_score:Q", title="Mean review score", format=".2f"),
+                    alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+                ],
+            )
+            pay_late_line = pay_base.mark_line(point=True, color="#003D7C", strokeDash=[4, 3]).encode(
+                y=alt.Y("late_rate:Q", title="Late rate (%)"),
+            )
+            st.altair_chart(
+                alt.layer(pay_score_line, pay_late_line).resolve_scale(y="independent").properties(height=300),
+                use_container_width=True,
+            )
+        st.caption(
+            "Payment types with ≥50 matched delivered orders. Primary payment "
+            "(`payment_sequential == 1`) per order, from "
+            "`olist_order_payments_dataset.csv`. Orange = review score (left axis), "
+            "dashed blue = late rate (right axis)."
+        )
+
+    with st.container(border=True):
+        boxed_label("Payment method — lead-time breakdown")
+        stage_bar = alt.Chart(payment_stages).mark_bar().encode(
+            y=alt.Y("payment_type:N", title=None, sort=payment_order),
+            x=alt.X("days:Q", title="Mean days", stack="zero"),
+            color=alt.Color(
+                "stage:N",
+                title=None,
+                sort=stage_order,
+                scale=alt.Scale(domain=stage_order, range=STAGE_COLORS),
+                legend=alt.Legend(orient="bottom", columns=3),
+            ),
+            order=alt.Order("stage_order:Q"),
+            tooltip=[
+                alt.Tooltip("payment_type:N", title="Payment type"),
+                alt.Tooltip("stage:N", title="Stage"),
+                alt.Tooltip("days:Q", title="Mean delivery days", format=".2f"),
+                alt.Tooltip("orders:Q", title="Orders", format=","),
+            ],
+        )
+        st.altair_chart(stage_bar.properties(height=260), use_container_width=True)
+        st.caption(
+            "Same processing/handling/shipping stages slicing as the "
+            "Decomposition chart above, grouped by payment type instead of collapsed "
+            "into one overall summary. Same exclusions as Decomposition (negative "
+            "duration or missing timestamps)."
         )
