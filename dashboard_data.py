@@ -395,9 +395,19 @@ def build_seller_cuts(
 def build_retention_series(order_data: pd.DataFrame, granularity: str) -> tuple[pd.DataFrame, float]:
     customers = order_data.sort_values(["customer_unique_id", "order_purchase_timestamp", "order_id"]).copy()
     repeat_rate = customers.groupby("customer_unique_id")["order_id"].nunique().gt(1).mean()
-    customers["returning_customer"] = customers.groupby("customer_unique_id").cumcount().gt(0)
-    customers = trim_trend_window(customers, "order_purchase_timestamp")
-    series = add_period(customers, "order_purchase_timestamp", granularity).groupby(["period", "returning_customer"], as_index=False)["customer_unique_id"].nunique().pivot(index="period", columns="returning_customer", values="customer_unique_id").fillna(0).rename(columns={False: "new_customers", True: "returning_customers"}).reset_index()
+    customers = add_period(customers, "order_purchase_timestamp", granularity)
+    customers["first_period"] = customers.groupby("customer_unique_id")["period"].transform("min")
+    customer_periods = customers.drop_duplicates(["customer_unique_id", "period"]).copy()
+    customer_periods["returning_customer"] = customer_periods["period"].gt(customer_periods["first_period"])
+    customer_periods = trim_trend_window(customer_periods, "order_purchase_timestamp")
+    series = (
+        customer_periods.groupby(["period", "returning_customer"])["customer_unique_id"]
+        .nunique()
+        .unstack(fill_value=0)
+        .reindex(columns=[False, True], fill_value=0)
+        .rename(columns={False: "new_customers", True: "returning_customers"})
+        .reset_index()
+    )
     series = complete_periods(series, granularity)
     series["returning_customer_share"] = series["returning_customers"] / (series["new_customers"] + series["returning_customers"]).replace(0, pd.NA) * 100
     return series, repeat_rate

@@ -1,6 +1,7 @@
 streamlit
 pandas
 altair
+matplotlib
 folium
 branca
 ipython
