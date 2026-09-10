@@ -5,6 +5,7 @@ from pathlib import Path
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from dashboard_data import (
     build_category_cuts,
@@ -32,6 +33,7 @@ ORDERS_PATH = Path("data/olist_orders_dataset.csv")
 SELLERS_PATH = Path("data/olist_sellers_dataset.csv")
 GEOLOCATION_PATH = Path("data/olist_geolocation_dataset.csv")
 PAYMENTS_PATH = Path("data/olist_order_payments_dataset.csv")
+MAP_PATH = Path("brazil_order_density_map.html")
 BLUE = "#003D7C"
 ORANGE = "#EF7C00"
 
@@ -67,8 +69,8 @@ def line_chart(
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-overview_tab, delivery_correlations_tab = st.tabs(
-    ["Overview", "Delivery correlations"]
+overview_tab, delivery_correlations_tab, map_tab = st.tabs(
+    ["Overview", "Delivery correlations", "Mapped orders and sellers"]
 )
 
 with overview_tab:
@@ -970,4 +972,21 @@ with delivery_correlations_tab:
             "Decomposition chart above, grouped by payment type instead of collapsed "
             "into one overall summary. Same exclusions as Decomposition (negative "
             "duration or missing timestamps)."
+        )
+
+with map_tab:
+    st.header("Brazil order and seller map")
+    st.caption(
+        "Interactive Folium map generated using zipcodes from geolocation dataset"
+        " and publically available .geojson values for Brazil"
+        ". Use the layer control in the top-right corner to switch between order density, seller density, "
+        "seller-buyer routes, and state order density."
+    )
+    if not MAP_PATH.exists():
+        st.error("Map not found. Run geomapper.py from the project folder first.")
+    else:
+        components.html(
+            MAP_PATH.read_text(encoding="utf-8"),
+            height=760,
+            scrolling=False,
         )
