@@ -70,7 +70,7 @@ def add_order_density_layer(map_object, data_directory="data"):
     geo = pd.read_csv(f"{data_directory}/olist_geolocation_dataset.csv", low_memory=False)
     locations = _calculate_order_locations(orders, customers, geo)
 
-    density_layer = folium.FeatureGroup(name="Order density", show=False)
+    density_layer = folium.FeatureGroup(name="Order density", show=True)
     density_layer.add_to(map_object)
     HeatMap(
         locations[["latitude", "longitude", "heat_intensity"]].values.tolist(),

@@ -7,7 +7,7 @@ import folium
 import pandas as pd
 
 
-MIN_ROUTE_ORDERS = 10
+MIN_ROUTE_ORDERS = 50
 
 
 def _city_key(city, state):
@@ -121,8 +121,8 @@ def add_seller_buyer_routes_layer(map_object, data_directory="data"):
                 "seller_city": route.seller_city,
                 "buyer_city": route.buyer_city,
                 "route_orders": int(route.route_orders),
-                "route_weight": 0.6 + 2.4 * intensity,
-                "route_opacity": 0.08 + 0.37 * intensity
+                "route_weight": 0.5 + 1.8 * intensity,
+                "route_opacity": 0.10 + 0.28 * intensity
             },
             "geometry": {
                 "type": "LineString",
@@ -139,11 +139,16 @@ def add_seller_buyer_routes_layer(map_object, data_directory="data"):
     folium.GeoJson(
         route_data,
         style_function=lambda feature: {
-            "color": "#1d4ed8",
+            "color": "#2563a6",
             "weight": feature["properties"]["route_weight"],
             "opacity": feature["properties"]["route_opacity"],
             "lineCap": "round",
             "lineJoin": "round"
+        },
+        highlight_function=lambda feature: {
+            "color": "#f59e0b",
+            "weight": feature["properties"]["route_weight"] + 2,
+            "opacity": 0.95,
         },
         tooltip=folium.GeoJsonTooltip(
             fields=["seller_city", "buyer_city", "route_orders"],

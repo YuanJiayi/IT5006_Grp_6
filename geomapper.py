@@ -1,6 +1,7 @@
 import json
 
 import folium
+from branca.element import Element
 from map_layers.order_density import add_order_density_layer #Add new layers to map like this
 from map_layers.seller_density import add_seller_density_layer
 from map_layers.seller_buyer_routes import add_seller_buyer_routes_layer
@@ -18,9 +19,37 @@ brazil_map = folium.Map(
     zoom_start=4.5,
     min_zoom=4,
     max_bounds=True,
-    tiles="OpenStreetMap",
+    tiles=None,
     control_scale=True
 )
+
+# Base-map examples can be compared from the layer control in the top-right.
+tile_layers = [
+    {
+        "name": "OpenTopoMap (terrain)",
+        "tiles": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        "attr": "Map data &copy; OpenStreetMap contributors, SRTM | Map style &copy; OpenTopoMap",
+        "control": True,
+        "show": False,
+    },
+    {
+        "name": "Esri World Street Map",
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Tiles &copy; Esri",
+        "control": True,
+        "show": True,
+    },
+    {
+        "name": "Esri World Imagery (satellite)",
+        "tiles": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "attr": "Tiles &copy; Esri",
+        "control": True,
+        "show": False,
+    },
+]
+
+for tile_layer in tile_layers:
+    folium.TileLayer(**tile_layer).add_to(brazil_map)
 
 folium.GeoJson(
     brazil_boundary,
@@ -51,6 +80,40 @@ add_seller_buyer_routes_layer(brazil_map)
 add_state_order_density_layer(brazil_map)
 
 folium.LayerControl(collapsed=False).add_to(brazil_map)
+
+map_style = """
+<style>
+.leaflet-control-layers {
+    background: rgba(255, 255, 255, 0.97);
+    border: 1px solid #d7dee8;
+    border-radius: 10px;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+    color: #1f2937;
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 7px 9px;
+}
+.leaflet-control-layers-list {
+    margin: 2px 0;
+}
+.leaflet-control-layers-base label,
+.leaflet-control-layers-overlays label {
+    border-radius: 6px;
+    display: flex;
+    gap: 7px;
+    margin: 1px 0;
+    padding: 5px 6px;
+}
+.leaflet-control-layers-base label:hover,
+.leaflet-control-layers-overlays label:hover {
+    background: #eef4fb;
+}
+.leaflet-control-layers input {
+    accent-color: #2563a6;
+    margin: 2px 0 0;
+}
+</style>
+"""
+brazil_map.get_root().header.add_child(Element(map_style))
 
 # Fit the map to Brazil rather than only the order locations.
 brazil_map.fit_bounds(brazil_bounds)
