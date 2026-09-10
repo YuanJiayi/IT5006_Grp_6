@@ -41,6 +41,17 @@ def latest_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _latest_rating_reviews(reviews: pd.DataFrame) -> pd.DataFrame:
+    """Match the ratings notebook's deterministic duplicate-review tie-breaker."""
+    ratings = reviews.copy()
+    ratings["review_answer_timestamp"] = pd.to_datetime(
+        ratings["review_answer_timestamp"]
+    )
+    return ratings.sort_values(
+        ["order_id", "review_creation_date", "review_answer_timestamp", "review_id"]
+    ).drop_duplicates("order_id", keep="last")
+
+
 def add_period(data: pd.DataFrame, date_column: str, granularity: str) -> pd.DataFrame:
     return data.assign(
         period=data[date_column].dt.to_period(PERIOD_ALIASES[granularity]).dt.to_timestamp()
@@ -145,6 +156,145 @@ def build_delivery_review_analysis(order_data: pd.DataFrame, reviews: pd.DataFra
     data["lateness_band"] = pd.cut(data["days_late"], [-float("inf"), 0, 3, 7, float("inf")], labels=["On time or early", "1–3 days late", "4–7 days late", "8+ days late"])
     severity = data.groupby("lateness_band", observed=True, as_index=False)["low_rating"].mean().assign(low_rating_rate=lambda frame: frame["low_rating"] * 100)
     return comparison, severity, risk_ratio
+
+
+def _rating_rate_summary(data: pd.DataFrame, group: str) -> pd.DataFrame:
+    """Summarise a binary low-rating outcome with 95% Wilson intervals."""
+    summary = (
+        data.groupby(group, observed=True)["low_rating"]
+        .agg(orders="size", low_ratings="sum")
+        .reset_index()
+    )
+    n = summary["orders"].astype(float)
+    proportion = summary["low_ratings"] / n
+    z = 1.96
+    centre = (proportion + z**2 / (2 * n)) / (1 + z**2 / n)
+    half_width = (
+        z
+        * np.sqrt(proportion * (1 - proportion) / n + z**2 / (4 * n**2))
+        / (1 + z**2 / n)
+    )
+    summary["low_rating_rate"] = proportion * 100
+    summary["lower_rate"] = (centre - half_width) * 100
+    summary["upper_rate"] = (centre + half_width) * 100
+    return summary
+
+
+@st.cache_data
+def build_rating_complexity_summary(
+    items_path: Path, reviews_path: Path
+) -> pd.DataFrame:
+    """Compare low-rating rates for single- and multi-item/seller orders."""
+    items = pd.read_csv(
+        items_path, usecols=["order_id", "order_item_id", "seller_id"]
+    )
+    order_complexity = items.groupby("order_id", as_index=False).agg(
+        item_count=("order_item_id", "size"),
+        seller_count=("seller_id", "nunique"),
+    )
+    reviewed = order_complexity.merge(
+        _latest_rating_reviews(load_reviews(reviews_path))[["order_id", "review_score"]],
+        on="order_id",
+        how="inner",
+        validate="one_to_one",
+    ).assign(low_rating=lambda frame: frame["review_score"].le(2))
+
+    item_groups = reviewed.assign(
+        group=np.where(reviewed["item_count"].gt(1), "Multiple items", "Single item")
+    )
+    item_summary = _rating_rate_summary(item_groups, "group").assign(
+        dimension="Number of items"
+    )
+    seller_groups = reviewed.assign(
+        group=np.where(
+            reviewed["seller_count"].gt(1), "Multiple sellers", "Single seller"
+        )
+    )
+    seller_summary = _rating_rate_summary(seller_groups, "group").assign(
+        dimension="Number of sellers"
+    )
+    summary = pd.concat([item_summary, seller_summary], ignore_index=True)
+    summary["group_order"] = summary["group"].map(
+        {
+            "Single item": 1,
+            "Multiple items": 2,
+            "Single seller": 1,
+            "Multiple sellers": 2,
+        }
+    )
+    summary["order_share"] = summary["orders"] / len(reviewed) * 100
+    summary["low_rating_capture"] = (
+        summary["low_ratings"] / reviewed["low_rating"].sum() * 100
+    )
+    return summary
+
+
+@st.cache_data
+def build_rating_delivery_timing_summary(
+    orders_path: Path, items_path: Path, reviews_path: Path
+) -> pd.DataFrame:
+    """Summarise delivery timing within the item-bearing ratings population."""
+    orders = pd.read_csv(
+        orders_path,
+        usecols=[
+            "order_id",
+            "order_purchase_timestamp",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+        ],
+        parse_dates=[
+            "order_purchase_timestamp",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+        ],
+    )
+    item_order_ids = pd.read_csv(items_path, usecols=["order_id"]).drop_duplicates()
+    reviewed = orders.merge(
+        item_order_ids,
+        on="order_id",
+        how="inner",
+        validate="one_to_one",
+    ).merge(
+        _latest_rating_reviews(load_reviews(reviews_path))[["order_id", "review_score"]],
+        on="order_id",
+        how="inner",
+        validate="one_to_one",
+    ).dropna(
+        subset=["order_delivered_customer_date", "order_estimated_delivery_date"]
+    )
+    reviewed["delivery_days"] = (
+        reviewed["order_delivered_customer_date"]
+        - reviewed["order_purchase_timestamp"]
+    ).dt.total_seconds() / 86_400
+    reviewed = reviewed.loc[reviewed["delivery_days"].ge(0)].copy()
+    reviewed["days_vs_estimate"] = (
+        reviewed["order_delivered_customer_date"]
+        - reviewed["order_estimated_delivery_date"]
+    ).dt.total_seconds() / 86_400
+    timing_order = [
+        "More than 7 days early",
+        "0–7 days early",
+        "1–3 days late",
+        "4–7 days late",
+        "Over 7 days late",
+    ]
+    days = reviewed["days_vs_estimate"]
+    reviewed["delivery_timing"] = pd.Categorical(
+        np.select(
+            [days.lt(-7), days.le(0), days.le(3), days.le(7)],
+            timing_order[:-1],
+            default=timing_order[-1],
+        ),
+        categories=timing_order,
+        ordered=True,
+    )
+    summary = _rating_rate_summary(reviewed.assign(
+        low_rating=reviewed["review_score"].le(2)
+    ), "delivery_timing")
+    summary["timing_order"] = summary["delivery_timing"].map(
+        {label: index for index, label in enumerate(timing_order, start=1)}
+    ).astype(int)
+    return summary
 
 
 # ---------------------------------------------------------------------------
