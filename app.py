@@ -18,6 +18,8 @@ from dashboard_data import (
     build_leadtime_decomposition,
     build_payment_cuts,
     build_payment_stage_breakdown,
+    build_rating_complexity_summary,
+    build_rating_delivery_timing_summary,
     build_seller_cuts,
     eligible_deliveries,
     latest_reviews as select_latest_reviews,
@@ -33,6 +35,7 @@ ORDERS_PATH = Path("data/olist_orders_dataset.csv")
 SELLERS_PATH = Path("data/olist_sellers_dataset.csv")
 GEOLOCATION_PATH = Path("data/olist_geolocation_dataset.csv")
 PAYMENTS_PATH = Path("data/olist_order_payments_dataset.csv")
+ORDER_ITEMS_PATH = Path("data/olist_order_items_dataset.csv")
 MAP_PATH = Path("brazil_order_density_map.html")
 BLUE = "#003D7C"
 ORANGE = "#EF7C00"
@@ -69,8 +72,8 @@ def line_chart(
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-overview_tab, delivery_correlations_tab, map_tab = st.tabs(
-    ["Overview", "Delivery correlations", "Mapped orders and sellers"]
+overview_tab, delivery_correlations_tab, ratings_tab, map_tab = st.tabs(
+    ["Overview", "Delivery correlations", "Ratings", "Mapped orders and sellers"]
 )
 
 with overview_tab:
@@ -131,7 +134,8 @@ with overview_tab:
     eligible_delivery_orders = eligible_deliveries(order_data)
     st.caption(
         f"Purchase-date coverage: {purchase_time.min():%d %b %Y}–"
-        f"{purchase_time.max():%d %b %Y}. Each transaction row represents one order item."
+        f"{purchase_time.max():%d %b %Y}. Each transaction row represents one order item; "
+        "product sales exclude freight."
     )
     headline_columns = st.columns(5)
     headline_columns[0].metric("Product sales", f"R$ {product_revenue:,.0f}")
@@ -143,8 +147,8 @@ with overview_tab:
     st.divider()
     st.header("Growth and commercial performance")
     st.caption(
-        "Time-series figures show January 2017–August 2018, excluding the launch period "
-        "and incomplete boundary month."
+        "Figures 1–2 show January 2017–August 2018, excluding the launch period and "
+        "incomplete boundary month."
     )
     granularity = st.radio(
         "Time granularity for Figures 1–2",
@@ -174,8 +178,6 @@ with overview_tab:
     with sales_growth_column:
         st.markdown("#### Product sales")
         st.altair_chart(sales_growth_chart, use_container_width=True)
-    st.caption("Product sales exclude freight.")
-
     figure_heading(2, "Commercial performance over time")
     commercial_series = build_commercial_series(line_items, granularity)
     commercial_aov_column, commercial_items_column = st.columns(2)
@@ -205,9 +207,7 @@ with overview_tab:
             ),
             use_container_width=True,
         )
-    st.caption(
-        "Average order value is based on product sales and excludes freight."
-    )
+    st.caption("Average order value is product sales per order.")
 
     st.divider()
     st.header("Marketplace composition")
@@ -231,7 +231,6 @@ with overview_tab:
             .properties(height=350)
         )
         st.altair_chart(geography_chart, use_container_width=True)
-        st.caption("Each order is counted once; shares use all consolidated orders.")
 
     with category_column:
         figure_heading(4, "Top 10 product categories")
@@ -294,7 +293,7 @@ with overview_tab:
         )
         st.altair_chart(category_chart, use_container_width=True)
         st.caption(
-            "Product sales exclude freight; missing or untranslated categories are retained as Unknown."
+            "Missing or untranslated categories are retained as Unknown."
         )
 
     st.divider()
@@ -386,9 +385,8 @@ with overview_tab:
     )
     st.caption(
         f"Sellers are ranked from highest to lowest product sales. The dashed diagonal "
-        f"represents equal distribution; the top 10% ({top_decile_count:,} of "
-        f"{seller_count:,} sellers) generated {top_decile_share:.1f}% of product sales. "
-        "Product sales exclude freight."
+        f"shows equal distribution; the top 10% ({top_decile_count:,} sellers) generated "
+        f"{top_decile_share:.1f}% of product sales."
     )
 
     figure_heading(6, "Customer purchase-frequency distribution")
@@ -443,9 +441,7 @@ with overview_tab:
         text="Share label:N"
     )
     st.altair_chart(frequency_bars + frequency_labels, use_container_width=True)
-    st.caption(
-        f"Orders per customer within {purchase_time.min():%b %Y}–{purchase_time.max():%b %Y}."
-    )
+    st.caption("Purchase frequency covers the full dataset period.")
 
     st.divider()
     st.header("Customer reviews")
@@ -511,8 +507,8 @@ with overview_tab:
     )
     st.altair_chart(delivery_trend, use_container_width=True)
     st.caption(
-        "January 2017–August 2018. Delivered orders with an estimated date and latest review. "
-        "Late means delivered after the estimated date; low rating means 1–2 stars."
+        "Late-delivery and low-rating rates increased together during the main peaks. "
+        "Results cover January 2017–August 2018 and orders with the required delivery and review data."
     )
 
     figure_heading(9, "Low-rating rate by delivery timing")
@@ -574,8 +570,8 @@ with overview_tab:
     st.altair_chart(comparison_chart + comparison_labels, use_container_width=True)
     st.metric("Late-order low-rating risk ratio", f"{risk_ratio:.2f}×")
     st.caption(
-        "Full dataset period; delivered orders with an estimated date and latest review. "
-        "The comparison is associative, not causal."
+        "Delivered orders with an estimated date and latest review. The comparison shows "
+        "an association and does not establish causation."
     )
 
 
@@ -973,6 +969,164 @@ with delivery_correlations_tab:
             "into one overall summary. Same exclusions as Decomposition (negative "
             "duration or missing timestamps)."
         )
+
+with ratings_tab:
+    ratings_required = [ORDER_ITEMS_PATH, ORDERS_PATH, REVIEWS_PATH]
+    if not all(path.exists() for path in ratings_required):
+        st.error("Required data files for this tab could not be found in the `data` folder.")
+        st.stop()
+
+    st.header("Low-rating candidate exploration")
+    st.caption(
+        "A low rating is a latest review score of 1–2. Analysis includes reviewed orders "
+        "with at least one recorded item. Relationships shown are exploratory associations "
+        "and do not establish causation."
+    )
+
+    complexity_summary = build_rating_complexity_summary(
+        ORDER_ITEMS_PATH, REVIEWS_PATH
+    )
+    timing_summary = build_rating_delivery_timing_summary(
+        ORDERS_PATH, ORDER_ITEMS_PATH, REVIEWS_PATH
+    )
+
+    figure_heading(10, "Low-rating rate by delivery timing")
+    timing_order = timing_summary.sort_values("timing_order")[
+        "delivery_timing"
+    ].astype(str).tolist()
+    timing_base = alt.Chart(timing_summary).encode(
+        x=alt.X(
+            "delivery_timing:N",
+            title="Performance against estimated delivery date",
+            sort=timing_order,
+            axis=alt.Axis(labelAngle=-20),
+        ),
+        tooltip=[
+            alt.Tooltip("delivery_timing:N", title="Delivery timing"),
+            alt.Tooltip(
+                "low_rating_rate:Q", title="Low-rating rate (%)", format=".1f"
+            ),
+            alt.Tooltip("orders:Q", title="Reviewed orders", format=","),
+        ],
+    )
+    timing_intervals = timing_base.mark_rule(
+        color="#31333F", strokeWidth=2
+    ).encode(
+        y=alt.Y(
+            "lower_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 85]),
+        ),
+        y2="upper_rate:Q",
+    )
+    timing_line = timing_base.mark_line(
+        color=ORANGE, point=alt.OverlayMarkDef(filled=True, size=120), strokeWidth=2.5
+    ).encode(
+        y=alt.Y(
+            "low_rating_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 85]),
+        )
+    )
+    st.altair_chart(
+        (timing_intervals + timing_line).properties(height=360),
+        use_container_width=True,
+    )
+    st.caption(
+        "Low-rating rates rise as deliveries become later. Vertical lines are 95% Wilson "
+        "confidence intervals."
+    )
+
+    st.divider()
+    figure_heading(11, "Low-rating rate by order complexity")
+    complexity_order = [
+        "Single item",
+        "Multiple items",
+        "Single seller",
+        "Multiple sellers",
+    ]
+    complexity_base = alt.Chart(complexity_summary).encode(
+        x=alt.X(
+            "group:N",
+            title=None,
+            sort=complexity_order,
+            axis=alt.Axis(labelAngle=0),
+        ),
+        tooltip=[
+            alt.Tooltip("group:N", title="Order group"),
+            alt.Tooltip(
+                "low_rating_rate:Q", title="Low-rating rate (%)", format=".1f"
+            ),
+            alt.Tooltip("orders:Q", title="Reviewed orders", format=","),
+            alt.Tooltip(
+                "order_share:Q", title="Share of eligible orders (%)", format=".2f"
+            ),
+            alt.Tooltip(
+                "low_rating_capture:Q",
+                title="Share of low ratings captured (%)",
+                format=".1f",
+            ),
+        ],
+    ).properties(height=330, width=360)
+    complexity_intervals = complexity_base.mark_rule(
+        color="#31333F", strokeWidth=2
+    ).encode(
+        y=alt.Y(
+            "lower_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 55]),
+        ),
+        y2="upper_rate:Q",
+    )
+    complexity_lower_caps = complexity_base.mark_tick(
+        color="#31333F", thickness=2, width=14
+    ).encode(
+        y=alt.Y(
+            "lower_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 55]),
+        )
+    )
+    complexity_upper_caps = complexity_base.mark_tick(
+        color="#31333F", thickness=2, width=14
+    ).encode(
+        y=alt.Y(
+            "upper_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 55]),
+        )
+    )
+    complexity_points = complexity_base.mark_point(
+        color=BLUE, filled=True, size=70
+    ).encode(
+        y=alt.Y(
+            "low_rating_rate:Q",
+            title="Low-rating rate (%)",
+            scale=alt.Scale(domain=[0, 55]),
+        )
+    )
+    complexity_chart = alt.layer(
+        complexity_intervals,
+        complexity_lower_caps,
+        complexity_upper_caps,
+        complexity_points,
+    ).facet(
+        column=alt.Column(
+            "dimension:N",
+            title=None,
+            sort=["Number of items", "Number of sellers"],
+            header=alt.Header(labelFontSize=14, labelFontWeight="bold"),
+        ),
+        spacing=45,
+    ).resolve_scale(x="independent")
+    st.altair_chart(complexity_chart, use_container_width=True)
+
+    st.caption(
+        "Multi-item and multi-seller orders have higher low-rating rates, but multi-seller "
+        "orders are rare and their estimate is less precise. Vertical lines are 95% Wilson "
+        "confidence intervals."
+    )
+
 
 with map_tab:
     st.header("Brazil order and seller map")
