@@ -1,7 +1,9 @@
 streamlit
 pandas
+numpy
 altair
 matplotlib
 folium
 branca
+jinja2
 ipython
