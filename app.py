@@ -1043,6 +1043,32 @@ with capacity_tab:
         "is partly a capacity/throughput problem, not just a per-order attribute."
     )
 
+    st.subheader("Does weekly volume actually predict delivery time?")
+    volume_corr = capacity_series["orders"].corr(capacity_series[capacity_value_column])
+    volume_scatter = alt.Chart(capacity_series).mark_circle(color=BLUE, size=90, opacity=0.75).encode(
+        x=alt.X("orders:Q", title="Weekly order volume"),
+        y=alt.Y(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days (that week)"),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+            alt.Tooltip(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days", format=".1f"),
+        ],
+    )
+    volume_trend = volume_scatter.transform_regression("orders", capacity_value_column).mark_line(
+        color="#EF7C00", strokeDash=[5, 3], strokeWidth=2.5
+    )
+    st.altair_chart(
+        (volume_scatter + volume_trend).properties(height=340),
+        use_container_width=True,
+    )
+    st.caption(
+        f"Each point is one week (n={len(capacity_series)}). Pearson r = {volume_corr:.2f} between "
+        "weekly order volume and that week's delivery time, a weak relationship. Points spread across "
+        "almost the full range of delivery times at nearly every volume level, so a busy week alone does "
+        "not reliably predict a slow week; delay is better explained by other factors such as accumulated "
+        "backlog (see below) than by concurrent volume."
+    )
+
     st.subheader("Purchase timing: day-of-week × hour heatmap")
     heatmap_metric_choice = st.radio(
         "Colour by",
