@@ -817,3 +817,76 @@ def build_stage_duration_by_weekday(orders_path: Path) -> pd.DataFrame:
     )
     long["stage"] = long["stage_key"].map(LEAD_STAGE_LABELS)
     return long
+
+
+# ---------------------------------------------------------------------------
+# Problem Candidate 1 tab (delivery lead-time prediction)
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data
+def build_weekday_delivery_summary(order_data: pd.DataFrame) -> pd.DataFrame:
+    """Mean delivery days and late-rate by the day of week the order was purchased."""
+    delivered = eligible_deliveries(order_data).drop_duplicates("order_id")
+    grouped = delivered.groupby("day_of_week", as_index=False).agg(
+        mean_delivery_days=("delivery_days", "mean"),
+        late_rate=("is_on_time", lambda values: (~values.astype(bool)).mean()),
+        orders=("order_id", "size"),
+    )
+    grouped["late_rate"] *= 100
+    grouped["day_order"] = grouped["day_of_week"].map(
+        {day: index for index, day in enumerate(DAY_OF_WEEK_ORDER)}
+    )
+    return grouped.sort_values("day_order")
+
+
+@st.cache_data
+def build_complexity_delivery_summary(line_items: pd.DataFrame) -> pd.DataFrame:
+    """Mean delivery days by order complexity (item count, seller count)."""
+    orders = eligible_deliveries(line_items).drop_duplicates("order_id")[
+        ["order_id", "delivery_days"]
+    ]
+    item_counts = line_items.groupby("order_id").size().rename("item_count")
+    seller_counts = line_items.groupby("order_id")["seller_id"].nunique().rename("seller_count")
+    merged = orders.merge(item_counts, on="order_id").merge(seller_counts, on="order_id")
+
+    groups = {
+        "Single item": merged["item_count"].eq(1),
+        "Multiple items": merged["item_count"].gt(1),
+        "Single seller": merged["seller_count"].eq(1),
+        "Multiple sellers": merged["seller_count"].gt(1),
+    }
+    rows = [
+        {"group": label, "mean_delivery_days": merged.loc[mask, "delivery_days"].mean(), "orders": int(mask.sum())}
+        for label, mask in groups.items()
+    ]
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def build_weight_buckets(line_items: pd.DataFrame, buckets: int = 6) -> pd.DataFrame:
+    """Total order weight (summed across items) vs. delivery days and late-rate."""
+    orders = eligible_deliveries(line_items).drop_duplicates("order_id")[
+        ["order_id", "delivery_days", "is_on_time"]
+    ]
+    order_weight = line_items.groupby("order_id", as_index=False)["product_weight_g"].sum()
+    merged = orders.merge(order_weight, on="order_id", how="left").dropna(subset=["product_weight_g"])
+    merged = merged.loc[merged["product_weight_g"] > 0].copy()
+    merged["late"] = ~merged["is_on_time"].astype(bool)
+    merged["weight_bucket"] = pd.qcut(merged["product_weight_g"], buckets, duplicates="drop")
+
+    grouped = (
+        merged.groupby("weight_bucket", observed=True)
+        .agg(
+            mean_weight_g=("product_weight_g", "mean"),
+            mean_delivery_days=("delivery_days", "mean"),
+            late_rate=("late", "mean"),
+            orders=("order_id", "size"),
+        )
+        .reset_index()
+    )
+    grouped["late_rate"] *= 100
+    grouped["weight_label"] = grouped["weight_bucket"].apply(
+        lambda interval: f"{max(interval.left, 0):,.0f}–{interval.right:,.0f}"
+    )
+    return grouped
