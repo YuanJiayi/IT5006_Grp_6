@@ -12,6 +12,7 @@ from dashboard_data import (
     build_capacity_series,
     build_category_cuts,
     build_commercial_series,
+    build_complexity_delivery_summary,
     build_delivery_experience_series,
     build_delivery_review_analysis,
     build_distance_buckets,
@@ -28,6 +29,8 @@ from dashboard_data import (
     build_seller_cuts,
     build_stage_duration_by_weekday,
     build_stage_duration_series,
+    build_weekday_delivery_summary,
+    build_weight_buckets,
     DAY_OF_WEEK_ORDER,
     eligible_deliveries,
     latest_reviews as select_latest_reviews,
@@ -80,8 +83,8 @@ def line_chart(
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-overview_tab, delivery_correlations_tab, ratings_tab, capacity_tab, map_tab = st.tabs(
-    ["Overview", "Delivery correlations", "Candidate 2", "Operational Capacity", "Mapped orders and sellers"]
+overview_tab, delivery_correlations_tab, capacity_tab, map_tab, problem1_tab, ratings_tab = st.tabs(
+    ["Overview", "Delivery correlations", "Operational Capacity", "Mapped orders and sellers", "Candidate 1", "Candidate 2"]
 )
 
 with overview_tab:
@@ -1026,6 +1029,32 @@ with capacity_tab:
         "is partly a capacity/throughput problem, not just a per-order attribute."
     )
 
+    st.subheader("Does weekly volume actually predict delivery time?")
+    volume_corr = capacity_series["orders"].corr(capacity_series[capacity_value_column])
+    volume_scatter = alt.Chart(capacity_series).mark_circle(color=BLUE, size=90, opacity=0.75).encode(
+        x=alt.X("orders:Q", title="Weekly order volume"),
+        y=alt.Y(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days (that week)"),
+        tooltip=[
+            alt.Tooltip("period:T", title="Week of"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+            alt.Tooltip(f"{capacity_value_column}:Q", title=f"{capacity_stat_choice} delivery days", format=".1f"),
+        ],
+    )
+    volume_trend = volume_scatter.transform_regression("orders", capacity_value_column).mark_line(
+        color="#EF7C00", strokeDash=[5, 3], strokeWidth=2.5
+    )
+    st.altair_chart(
+        (volume_scatter + volume_trend).properties(height=340),
+        use_container_width=True,
+    )
+    st.caption(
+        f"Each point is one week (n={len(capacity_series)}). Pearson r = {volume_corr:.2f} between "
+        "weekly order volume and that week's delivery time, a weak relationship. Points spread across "
+        "almost the full range of delivery times at nearly every volume level, so a busy week alone does "
+        "not reliably predict a slow week; delay is better explained by other factors such as accumulated "
+        "backlog (see below) than by concurrent volume."
+    )
+
     st.subheader("Purchase timing: day-of-week × hour heatmap")
     heatmap_metric_choice = st.radio(
         "Colour by",
@@ -1397,6 +1426,241 @@ with ratings_tab:
         "Multi-item and multi-seller orders have higher low-rating rates, but multi-seller "
         "orders are rare and their estimate is less precise. Vertical lines are 95% Wilson "
         "confidence intervals."
+    )
+
+
+with problem1_tab:
+    st.header("Candidate Problem 1: Delivery lead-time prediction")
+    st.caption(
+        "This page presents the exploratory evidence supporting Problem Statement 1: "
+        "predicting delivery lead time as a regression on delivery days, and "
+        "predicting on-time/late status as a classification against Olist's "
+        "estimated delivery date. Each chart below examines a candidate predictor's "
+        "relationship with delivery outcomes."
+    )
+
+    weekday_summary = build_weekday_delivery_summary(capacity_orders)
+    complexity_delivery = build_complexity_delivery_summary(line_items)
+    weight_buckets = build_weight_buckets(capacity_line_items)
+    p1_stage_colors = ["#EF7C00", "#003D7C", "#7FA9D0"]
+
+    st.subheader("Delivery time and late-rate by customer–seller distance")
+    dist_base = alt.Chart(distance_buckets).encode(
+        x=alt.X(
+            "distance_label:N",
+            title="Distance (km, sextiles)",
+            sort=distance_buckets["distance_label"].tolist(),
+        )
+    )
+    dist_bars = dist_base.mark_bar(color="#7FA9D0").encode(
+        y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+        tooltip=[
+            alt.Tooltip("distance_label:N", title="Distance (km)"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    dist_late_line = dist_base.mark_line(color="#EF7C00", point=True).encode(
+        y=alt.Y("late_rate:Q", title="Late rate (%)"),
+        tooltip=[alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f")],
+    )
+    st.altair_chart(
+        alt.layer(dist_bars, dist_late_line).resolve_scale(y="independent").properties(height=320),
+        use_container_width=True,
+    )
+    st.caption(
+        "Bars indicate mean delivery days (left axis); the line indicates the "
+        "late-delivery rate against Olist's estimate (right axis), both by distance "
+        "sextile. Mean delivery time increases substantially with distance, more "
+        "than tripling between the nearest and farthest sextiles, while the "
+        "late-rate increases only modestly over the same range. This divergence "
+        "suggests that Olist's estimated delivery date already partially accounts "
+        "for distance, making distance a stronger candidate predictor for the "
+        "regression target than for the classification target."
+    )
+
+    st.subheader("Purchase timing: day-of-week × hour heatmap")
+    p1_heatmap_metric_choice = st.radio(
+        "Colour by",
+        ["Mean delivery days", "Order volume"],
+        horizontal=True,
+        key="p1_heatmap_metric",
+    )
+    p1_heatmap_metric_column = {"Mean delivery days": "mean_delivery_days", "Order volume": "orders"}[
+        p1_heatmap_metric_choice
+    ]
+    p1_heatmap_data = build_hour_dow_heatmap(capacity_orders)
+    p1_heatmap_chart = alt.Chart(p1_heatmap_data).mark_rect().encode(
+        x=alt.X("purchase_hour:O", title="Purchase hour"),
+        y=alt.Y("day_of_week:N", title=None, sort=DAY_OF_WEEK_ORDER),
+        color=alt.Color(
+            f"{p1_heatmap_metric_column}:Q",
+            title=p1_heatmap_metric_choice,
+            scale=alt.Scale(scheme="blues"),
+        ),
+        tooltip=[
+            alt.Tooltip("day_of_week:N", title="Day"),
+            alt.Tooltip("purchase_hour:O", title="Hour"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    st.altair_chart(p1_heatmap_chart.properties(height=320), use_container_width=True)
+    st.caption(
+        "Purchase day and hour are observed at order placement and therefore carry "
+        "no lookahead risk as model inputs. The heatmap indicates that mean "
+        "delivery time is not uniformly distributed across the purchase window, "
+        "supporting purchase timing as a viable, zero-cost predictor for the "
+        "lead-time model."
+    )
+
+    st.subheader("Mean delivery time by day of week purchased")
+    weekday_chart = alt.Chart(weekday_summary).mark_bar(color="#003D7C").encode(
+        x=alt.X("day_of_week:N", title=None, sort=DAY_OF_WEEK_ORDER),
+        y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+        tooltip=[
+            alt.Tooltip("day_of_week:N", title="Purchase day"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".2f"),
+            alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    ).properties(height=300)
+    st.altair_chart(weekday_chart, use_container_width=True)
+    st.caption(
+        "Mean delivery time varies by purchase day, ranging from 11.47 days for "
+        "Sunday purchases to 13.12 days for Friday purchases, a difference of "
+        "approximately 14%. This indicates that purchase day of week carries "
+        "predictive signal independent of distance or payment method."
+    )
+
+    st.subheader("Which stage slows down for weekend purchases?")
+    p1_weekday_stage = build_stage_duration_by_weekday(ORDERS_PATH)
+    p1_stage_key_order = ["processing_time", "handling_time", "shipping_time"]
+    p1_stage_key_colors = dict(zip(p1_stage_key_order, p1_stage_colors))
+    p1_stage_key_labels = dict(
+        zip(p1_stage_key_order, p1_weekday_stage.drop_duplicates("stage_key").set_index("stage_key")["stage"])
+    )
+    p1_weekday_cols = st.columns(3)
+    for col, stage_key in zip(p1_weekday_cols, p1_stage_key_order):
+        stage_data = p1_weekday_stage.loc[p1_weekday_stage["stage_key"] == stage_key]
+        with col:
+            st.markdown(f"###### {p1_stage_key_labels[stage_key]}")
+            stage_bar = alt.Chart(stage_data).mark_bar(color=p1_stage_key_colors[stage_key]).encode(
+                x=alt.X("day_of_week:N", title=None, sort=DAY_OF_WEEK_ORDER, axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("mean_days:Q", title="Mean days"),
+                tooltip=[
+                    alt.Tooltip("day_of_week:N", title="Purchase day"),
+                    alt.Tooltip("mean_days:Q", title="Mean days", format=".2f"),
+                ],
+            )
+            st.altair_chart(stage_bar.properties(height=240), use_container_width=True)
+    st.caption(
+        "Decomposing total lead time into its three constituent stages localises "
+        "the day-of-week effect observed above to the order-handling stage "
+        "(approval to carrier pickup); the shipping stage remains approximately "
+        "constant regardless of purchase day. This indicates that the day-of-week "
+        "effect originates in Olist's internal order-handling process rather than "
+        "in carrier transit, a distinction relevant to feature attribution."
+    )
+
+    st.subheader("Delivery time by payment method")
+    p1_pay_days = alt.Chart(payment_cuts).mark_bar(color="#003D7C").encode(
+        x=alt.X("payment_type:N", title=None, sort=payment_order),
+        y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+        tooltip=[
+            alt.Tooltip("payment_type:N", title="Payment type"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".2f"),
+            alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    st.altair_chart(p1_pay_days.properties(height=300), use_container_width=True)
+    st.caption(
+        "Mean delivery time differs by payment method: Boleto orders average 13.04 "
+        "days versus 11.88 for credit card. This is consistent with Boleto's "
+        "manual bank-confirmation requirement, which delays order approval prior "
+        "to fulfilment."
+    )
+
+    st.subheader("Lead-time breakdown by payment method")
+    p1_stage_bar = alt.Chart(payment_stages).mark_bar().encode(
+        y=alt.Y("payment_type:N", title=None, sort=payment_order),
+        x=alt.X("days:Q", title="Mean days", stack="zero"),
+        color=alt.Color(
+            "stage:N",
+            title=None,
+            sort=stage_order,
+            scale=alt.Scale(domain=stage_order, range=STAGE_COLORS),
+            legend=alt.Legend(orient="bottom", columns=3),
+        ),
+        order=alt.Order("stage_order:Q"),
+        tooltip=[
+            alt.Tooltip("payment_type:N", title="Payment type"),
+            alt.Tooltip("stage:N", title="Stage"),
+            alt.Tooltip("days:Q", title="Mean delivery days", format=".2f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    st.altair_chart(p1_stage_bar.properties(height=300), use_container_width=True)
+    st.caption(
+        "The same stage decomposition, grouped by payment method, confirms that "
+        "Boleto's additional lead time is concentrated in the processing stage "
+        "(purchase to approval), consistent with the manual confirmation "
+        "requirement, rather than being distributed across handling or shipping."
+    )
+
+    st.subheader("Delivery time by order complexity")
+    complexity_order = ["Single item", "Multiple items", "Single seller", "Multiple sellers"]
+    complexity_delivery_chart = alt.Chart(complexity_delivery).mark_bar(color="#003D7C").encode(
+        x=alt.X("group:N", title=None, sort=complexity_order),
+        y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+        tooltip=[
+            alt.Tooltip("group:N", title="Order group"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".2f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    ).properties(height=300)
+    st.altair_chart(complexity_delivery_chart, use_container_width=True)
+    st.caption(
+        "Order complexity shows a counter-intuitive relationship with delivery "
+        "time: multi-seller orders arrive faster on average than single-seller "
+        "orders (8.66 versus 12.14 days), and multi-item orders arrive modestly "
+        "faster than single-item orders (11.36 versus 12.17 days). The "
+        "multi-seller group is comparatively small (n = 1,275; order counts are "
+        "available on hover), so this estimate should be treated with some "
+        "caution pending further investigation of the underlying mechanism."
+    )
+
+    st.subheader("Delivery time by order weight")
+    p1_weight_base = alt.Chart(weight_buckets).encode(
+        x=alt.X(
+            "weight_label:N",
+            title="Total order weight (g, sextiles)",
+            sort=weight_buckets["weight_label"].tolist(),
+        )
+    )
+    p1_weight_bars = p1_weight_base.mark_bar(color="#7FA9D0").encode(
+        y=alt.Y("mean_delivery_days:Q", title="Mean delivery days"),
+        tooltip=[
+            alt.Tooltip("weight_label:N", title="Weight (g)"),
+            alt.Tooltip("mean_delivery_days:Q", title="Mean delivery days", format=".2f"),
+            alt.Tooltip("orders:Q", title="Orders", format=","),
+        ],
+    )
+    p1_weight_line = p1_weight_base.mark_line(color="#EF7C00", point=True).encode(
+        y=alt.Y("late_rate:Q", title="Late rate (%)"),
+        tooltip=[alt.Tooltip("late_rate:Q", title="Late rate (%)", format=".1f")],
+    )
+    st.altair_chart(
+        alt.layer(p1_weight_bars, p1_weight_line).resolve_scale(y="independent").properties(height=320),
+        use_container_width=True,
+    )
+    st.caption(
+        "Total order weight shows only a weak association with delivery time and "
+        "late-rate relative to distance; both series are comparatively flat across "
+        "weight sextiles. This suggests that, on its own, weight is a weaker "
+        "candidate predictor for the lead-time model than distance, purchase "
+        "timing, or payment method."
     )
 
 
