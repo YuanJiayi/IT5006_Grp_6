@@ -1,6 +1,8 @@
 """Data loading and aggregation helpers for the Olist dashboard."""
 
 from pathlib import Path
+import re
+import unicodedata
 
 import numpy as np
 import pandas as pd
@@ -295,6 +297,132 @@ def build_rating_delivery_timing_summary(
         {label: index for index, label in enumerate(timing_order, start=1)}
     ).astype(int)
     return summary
+
+
+@st.cache_data
+def build_review_score_correlations(
+    consolidated_path: Path,
+    customers_path: Path,
+    sellers_path: Path,
+    geo_path: Path,
+    reviews_path: Path,
+) -> pd.DataFrame:
+    """Match the route-distance notebook's Pearson feature screening."""
+    line_items = pd.read_csv(
+        consolidated_path,
+        usecols=[
+            "order_id",
+            "order_item_id",
+            "customer_id",
+            "seller_id",
+            "price",
+            "freight_value",
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+            "delivery_days",
+        ],
+        parse_dates=[
+            "order_delivered_customer_date",
+            "order_estimated_delivery_date",
+        ],
+    )
+    orders = line_items.groupby("order_id", as_index=False).agg(
+        customer_id=("customer_id", "first"),
+        seller_id=("seller_id", "first"),
+        total_item_price=("price", "sum"),
+        total_freight_value=("freight_value", "sum"),
+        item_count=("order_item_id", "size"),
+        order_delivered_customer_date=("order_delivered_customer_date", "first"),
+        order_estimated_delivery_date=("order_estimated_delivery_date", "first"),
+        delivery_days=("delivery_days", "first"),
+    )
+    customers = pd.read_csv(
+        customers_path, usecols=["customer_id", "customer_city", "customer_state"]
+    )
+    sellers = pd.read_csv(
+        sellers_path, usecols=["seller_id", "seller_city", "seller_state"]
+    )
+    orders = orders.merge(customers, on="customer_id", how="left").merge(
+        sellers, on="seller_id", how="left"
+    )
+    reviews = pd.read_csv(reviews_path, usecols=["order_id", "review_score"])
+    reviews = reviews.dropna(subset=["review_score"]).groupby(
+        "order_id", as_index=False
+    ).agg(review_score=("review_score", "mean"))
+    geo = pd.read_csv(
+        geo_path,
+        usecols=["geolocation_city", "geolocation_state", "geolocation_lat", "geolocation_lng"],
+    )
+
+    def city_key(city: str, state: str) -> str:
+        value = unicodedata.normalize("NFKD", f"{city} {state}".casefold())
+        value = "".join(character for character in value if not unicodedata.combining(character))
+        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+    geo["city_key"] = [
+        city_key(city, state)
+        for city, state in zip(geo["geolocation_city"], geo["geolocation_state"])
+    ]
+    coordinates = geo.groupby("city_key", as_index=False).agg(
+        latitude=("geolocation_lat", "mean"), longitude=("geolocation_lng", "mean")
+    )
+    orders["buyer_city_key"] = [
+        city_key(city, state)
+        for city, state in zip(orders["customer_city"], orders["customer_state"])
+    ]
+    orders["seller_city_key"] = [
+        city_key(city, state)
+        for city, state in zip(orders["seller_city"], orders["seller_state"])
+    ]
+    orders = orders.merge(
+        coordinates.rename(
+            columns={"city_key": "buyer_city_key", "latitude": "buyer_latitude", "longitude": "buyer_longitude"}
+        ),
+        on="buyer_city_key",
+        how="inner",
+    ).merge(
+        coordinates.rename(
+            columns={"city_key": "seller_city_key", "latitude": "seller_latitude", "longitude": "seller_longitude"}
+        ),
+        on="seller_city_key",
+        how="inner",
+    )
+    orders["route_distance_km"] = _haversine_km(
+        orders["seller_latitude"],
+        orders["seller_longitude"],
+        orders["buyer_latitude"],
+        orders["buyer_longitude"],
+    )
+    scored = orders.merge(reviews, on="order_id", how="inner").dropna(
+        subset=["route_distance_km", "review_score"]
+    )
+    delivery_dates_available = scored[
+        ["order_delivered_customer_date", "order_estimated_delivery_date"]
+    ].notna().all(axis=1)
+    scored["late_delivery"] = pd.Series(pd.NA, index=scored.index, dtype="boolean")
+    scored.loc[delivery_dates_available, "late_delivery"] = (
+        scored.loc[delivery_dates_available, "order_delivered_customer_date"]
+        > scored.loc[delivery_dates_available, "order_estimated_delivery_date"]
+    )
+    feature_labels = {
+        "route_distance_km": "Route distance",
+        "delivery_days": "Delivery days",
+        "late_delivery": "Late delivery",
+        "total_item_price": "Total item price",
+        "total_freight_value": "Total freight value",
+        "item_count": "Items per order",
+    }
+    rows = []
+    for feature, label in feature_labels.items():
+        pairs = scored[[feature, "review_score"]].dropna().astype(float)
+        rows.append(
+            {
+                "feature": label,
+                "correlation": pairs[feature].corr(pairs["review_score"]),
+                "orders": len(pairs),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("correlation").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

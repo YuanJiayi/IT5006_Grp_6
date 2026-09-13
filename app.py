@@ -26,6 +26,7 @@ from dashboard_data import (
     build_promise_buffer_series,
     build_rating_complexity_summary,
     build_rating_delivery_timing_summary,
+    build_review_score_correlations,
     build_seller_cuts,
     build_stage_duration_by_weekday,
     build_stage_duration_series,
@@ -1290,6 +1291,9 @@ with ratings_tab:
     timing_summary = build_rating_delivery_timing_summary(
         ORDERS_PATH, ORDER_ITEMS_PATH, REVIEWS_PATH
     )
+    score_correlations = build_review_score_correlations(
+        DATA_PATH, CUSTOMERS_PATH, SELLERS_PATH, GEOLOCATION_PATH, REVIEWS_PATH
+    )
 
     figure_heading(10, "Low-rating rate by delivery timing")
     timing_order = timing_summary.sort_values("timing_order")[
@@ -1339,19 +1343,22 @@ with ratings_tab:
     )
 
     st.divider()
-    figure_heading(11, "Low-rating rate by order complexity")
+    figure_columns = st.columns(2)
     complexity_order = [
         "Single item",
         "Multiple items",
         "Single seller",
         "Multiple sellers",
     ]
-    complexity_base = alt.Chart(complexity_summary).encode(
+    complexity_chart_data = complexity_summary.assign(
+        display_group=lambda frame: frame["group"].str.split().str[0]
+    )
+    complexity_base = alt.Chart(complexity_chart_data).encode(
         x=alt.X(
-            "group:N",
+            "display_group:N",
             title=None,
-            sort=complexity_order,
-            axis=alt.Axis(labelAngle=0),
+            sort=["Single", "Multiple"],
+            axis=alt.Axis(labelAngle=0, labelLimit=110),
         ),
         tooltip=[
             alt.Tooltip("group:N", title="Order group"),
@@ -1368,7 +1375,7 @@ with ratings_tab:
                 format=".1f",
             ),
         ],
-    ).properties(height=330, width=360)
+    ).properties(height=360, width=250)
     complexity_intervals = complexity_base.mark_rule(
         color="#31333F", strokeWidth=2
     ).encode(
@@ -1420,13 +1427,45 @@ with ratings_tab:
         ),
         spacing=45,
     ).resolve_scale(x="independent")
-    st.altair_chart(complexity_chart, use_container_width=True)
 
-    st.caption(
-        "Multi-item and multi-seller orders have higher low-rating rates, but multi-seller "
-        "orders are rare and their estimate is less precise. Vertical lines are 95% Wilson "
-        "confidence intervals."
+    correlation_base = alt.Chart(score_correlations).encode(
+        y=alt.Y("feature:N", title=None, sort=score_correlations["feature"].tolist()),
+        x=alt.X(
+            "correlation:Q",
+            title="Pearson correlation with review score",
+            scale=alt.Scale(domain=[-0.45, 0]),
+        ),
+        tooltip=[
+            alt.Tooltip("feature:N", title="Feature"),
+            alt.Tooltip("correlation:Q", title="Pearson correlation", format=".3f"),
+            alt.Tooltip("orders:Q", title="Reviewed orders", format=","),
+        ],
     )
+    correlation_bars = correlation_base.mark_bar(color=ORANGE)
+    correlation_zero = alt.Chart(pd.DataFrame({"zero": [0]})).mark_rule(
+        color="#31333F", strokeWidth=1
+    ).encode(x="zero:Q")
+    with figure_columns[0]:
+        figure_heading(11, "Low-rating rate by order complexity")
+        st.altair_chart(complexity_chart, use_container_width=True)
+        st.markdown(
+            "<div style='min-height:48px'>"
+            "<small>Multi-item and multi-seller orders have higher low-rating rates. "
+            "Lines show 95% Wilson confidence intervals.</small></div>",
+            unsafe_allow_html=True,
+        )
+    with figure_columns[1]:
+        figure_heading(12, "Feature correlations with review score")
+        st.altair_chart(
+            (correlation_bars + correlation_zero).properties(height=430),
+            use_container_width=True,
+        )
+        st.markdown(
+            "<div style='min-height:48px'>"
+            "<small>Correlations use reviewed orders with item records. Bars show "
+            "negative associations, not causal effects.</small></div>",
+            unsafe_allow_html=True,
+        )
 
 
 with problem1_tab:
