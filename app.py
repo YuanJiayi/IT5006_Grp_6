@@ -81,7 +81,7 @@ st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
 overview_tab, delivery_correlations_tab, ratings_tab, capacity_tab, map_tab = st.tabs(
-    ["Overview", "Delivery correlations", "Ratings", "Operational Capacity", "Mapped orders and sellers"]
+    ["Overview", "Delivery correlations", "Candidate 2", "Operational Capacity", "Mapped orders and sellers"]
 )
 
 with overview_tab:
