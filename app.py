@@ -83,22 +83,8 @@ def line_chart(
 st.set_page_config(page_title="IT5006 Olist Dashboard", layout="wide")
 st.title("Olist E-Commerce Dashboard")
 
-(
-    overview_tab,
-    delivery_correlations_tab,
-    ratings_tab,
-    capacity_tab,
-    problem1_tab,
-    map_tab,
-) = st.tabs(
-    [
-        "Overview",
-        "Delivery correlations",
-        "Ratings",
-        "Operational Capacity",
-        "Candidate Problem 1",
-        "Mapped orders and sellers",
-    ]
+overview_tab, delivery_correlations_tab, capacity_tab, map_tab, problem1_tab, ratings_tab = st.tabs(
+    ["Overview", "Delivery correlations", "Operational Capacity", "Mapped orders and sellers", "Candidate 1", "Candidate 2"]
 )
 
 with overview_tab:
